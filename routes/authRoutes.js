@@ -133,42 +133,45 @@ router.get('/license-check', async (req, res) => {
  * Creates a Stripe subscription checkout session
  * If a token is provided, we use userId as client_reference_id
  */
+// POST /api/auth/create-checkout-session
 router.post('/create-checkout-session', async (req, res) => {
-  if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
-  if (!STRIPE_PRICE_ID) return res.status(500).json({ error: 'Missing STRIPE_PRICE_ID' });
-
-  const { email } = req.body || {};
-  if (!email) return res.status(400).json({ error: 'Email required' });
-
-  // Optional: pull userId from auth header to pass to Stripe
-  let userId = null;
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  if (token) {
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      userId = decoded?.id;
-    } catch (_) {}
-  }
-
   try {
+    if (!stripe) throw new Error('Stripe secret key is missing');
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'Missing email' });
+
+    const PRICE_ID = process.env.STRIPE_PRICE_ID;
+    if (!PRICE_ID) throw new Error('Missing STRIPE_PRICE_ID');
+
+    // Safety check: if PRICE_ID is wrong or archived, this will throw
+    await stripe.prices.retrieve(PRICE_ID);
+
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
       mode: 'subscription',
       customer_email: email,
-      line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
-      success_url: `${FRONTEND_URL}/success.html`,
-      cancel_url: `${FRONTEND_URL}/cancel.html`,
-      client_reference_id: userId || undefined,
-      metadata: userId ? { userId: String(userId) } : {},
+      line_items: [{ price: PRICE_ID, quantity: 1 }],
+      allow_promotion_codes: true,
+      success_url: `${process.env.FRONTEND_URL}/success.html?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:  `${process.env.FRONTEND_URL}/cancel.html`,
     });
 
     return res.json({ url: session.url });
   } catch (err) {
-    console.error('Stripe session failed:', err?.message || err);
-    return res.status(500).json({ error: 'Stripe session failed' });
+    // Log and surface details so we immediately know why it failed
+    console.error('create-checkout-session failed:', {
+      message: err.message,
+      type: err.type,
+      code: err.code,
+    });
+    return res.status(500).json({
+      error: 'Stripe session failed',
+      detail: err.message,  // keep during setup; remove later if you prefer
+      type: err.type,
+      code: err.code,
+    });
   }
 });
+
 
 /**
  * GET /api/auth/test
