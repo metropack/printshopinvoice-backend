@@ -155,7 +155,6 @@ router.post('/create-checkout-session', async (req, res) => {
     return res.status(400).json({ error: 'Valid email required' });
   }
 
-  // Try linking this session to the user id we just registered
   let userIdForSession = null;
   try {
     const r = await pool.query('SELECT id FROM users WHERE lower(email) = $1', [normEmail]);
@@ -167,28 +166,46 @@ router.post('/create-checkout-session', async (req, res) => {
   try {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      payment_method_types: ['card'],
       customer_email: normEmail,
       line_items: [{ price: PRICE_ID, quantity: 1 }],
-      // helps webhook map payment -> user
       client_reference_id: userIdForSession ? String(userIdForSession) : undefined,
       metadata: userIdForSession ? { userId: String(userIdForSession) } : undefined,
       success_url: `${FRONTEND_URL}/success.html`,
       cancel_url: `${FRONTEND_URL}/cancel.html`,
     });
-
     return res.json({ url: session.url });
   } catch (err) {
-    // Print the *useful* bits. This shows up in Render Logs.
-    console.error('create-checkout-session error:',
+    console.error(
+      'create-checkout-session error:',
       err?.type || 'no-type',
       err?.message || err?.raw?.message || '(no message)',
-      'price:', PRICE_ID.slice(0, 10) + '…',
+      'price:', (process.env.STRIPE_PRICE_ID || '').slice(0, 10) + '…',
       'key mode:', (process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live_') ? 'LIVE' : 'TEST'
     );
     return res.status(500).json({ error: 'Stripe session failed' });
   }
 });
+
+router.get('/diag/stripe', async (_req, res) => {
+  if (!stripe) return res.status(500).json({ ok: false, error: 'Stripe not configured' });
+  try {
+    const price = await stripe.prices.retrieve(STRIPE_PRICE_ID);
+    return res.json({
+      ok: true,
+      price: {
+        id: price.id,
+        active: price.active,
+        currency: price.currency,
+        type: price.type,
+        recurring: price.recurring,
+        livemode: price.livemode,
+      }
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 
 
 
