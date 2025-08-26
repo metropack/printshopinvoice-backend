@@ -74,6 +74,11 @@ router.post('/register', async (req, res) => {
   }
 });
 
+// in routes/authRoutes.js (register handler)
+const token = jwt.sign({ id: userId, email }, JWT_SECRET, { expiresIn: '7d' });
+res.status(201).json({ message: 'Registered', userId, token });
+
+
 /**
  * POST /api/auth/login
  * Body: { email, password }
