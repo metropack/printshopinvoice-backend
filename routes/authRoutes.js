@@ -134,43 +134,62 @@ router.get('/license-check', async (req, res) => {
  * If a token is provided, we use userId as client_reference_id
  */
 // POST /api/auth/create-checkout-session
+// Create Stripe Checkout Session (subscription)
 router.post('/create-checkout-session', async (req, res) => {
+  if (!stripe) {
+    console.error('Stripe not configured: missing STRIPE_SECRET_KEY');
+    return res.status(500).json({ error: 'Stripe not configured' });
+  }
+
+  const PRICE_ID = process.env.STRIPE_PRICE_ID;
+  const FRONTEND_URL = process.env.FRONTEND_URL || 'https://mps-site-rouge.vercel.app';
+
+  if (!PRICE_ID) {
+    console.error('Missing STRIPE_PRICE_ID env var');
+    return res.status(500).json({ error: 'Missing STRIPE_PRICE_ID' });
+  }
+
+  const { email = '' } = req.body;
+  const normEmail = String(email).trim().toLowerCase();
+  if (!normEmail || !normEmail.includes('@')) {
+    return res.status(400).json({ error: 'Valid email required' });
+  }
+
+  // Try linking this session to the user id we just registered
+  let userIdForSession = null;
   try {
-    if (!stripe) throw new Error('Stripe secret key is missing');
-    const { email } = req.body || {};
-    if (!email) return res.status(400).json({ error: 'Missing email' });
+    const r = await pool.query('SELECT id FROM users WHERE lower(email) = $1', [normEmail]);
+    userIdForSession = r.rows[0]?.id || null;
+  } catch (dbErr) {
+    console.warn('Warning: could not lookup user id for client_reference_id:', dbErr.message);
+  }
 
-    const PRICE_ID = process.env.STRIPE_PRICE_ID;
-    if (!PRICE_ID) throw new Error('Missing STRIPE_PRICE_ID');
-
-    // Safety check: if PRICE_ID is wrong or archived, this will throw
-    await stripe.prices.retrieve(PRICE_ID);
-
+  try {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: email,
+      payment_method_types: ['card'],
+      customer_email: normEmail,
       line_items: [{ price: PRICE_ID, quantity: 1 }],
-      allow_promotion_codes: true,
-      success_url: `${process.env.FRONTEND_URL}/success.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url:  `${process.env.FRONTEND_URL}/cancel.html`,
+      // helps webhook map payment -> user
+      client_reference_id: userIdForSession ? String(userIdForSession) : undefined,
+      metadata: userIdForSession ? { userId: String(userIdForSession) } : undefined,
+      success_url: `${FRONTEND_URL}/success.html`,
+      cancel_url: `${FRONTEND_URL}/cancel.html`,
     });
 
     return res.json({ url: session.url });
   } catch (err) {
-    // Log and surface details so we immediately know why it failed
-    console.error('create-checkout-session failed:', {
-      message: err.message,
-      type: err.type,
-      code: err.code,
-    });
-    return res.status(500).json({
-      error: 'Stripe session failed',
-      detail: err.message,  // keep during setup; remove later if you prefer
-      type: err.type,
-      code: err.code,
-    });
+    // Print the *useful* bits. This shows up in Render Logs.
+    console.error('create-checkout-session error:',
+      err?.type || 'no-type',
+      err?.message || err?.raw?.message || '(no message)',
+      'price:', PRICE_ID.slice(0, 10) + '…',
+      'key mode:', (process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live_') ? 'LIVE' : 'TEST'
+    );
+    return res.status(500).json({ error: 'Stripe session failed' });
   }
 });
+
 
 
 /**
