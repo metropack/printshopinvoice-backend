@@ -21,6 +21,14 @@ const storeInfoRoutes    = require('./routes/storeInfoRoutes'); // exact case
 // ---- Guards (Option A: apply at mount) ----
 const authenticate       = require('./middleware/authenticate');
 const subscriptionGuard  = require('./middleware/subscriptionGuard');
+// after other route imports:
+const profileRoutes = require('./routes/profile');
+const billingRoutes = require('./routes/billing');
+
+// Protected routes (already using authenticate at app level or per-file)
+app.use('/api/profile', authenticate, profileRoutes);
+app.use('/api/billing', authenticate, billingRoutes);
+
 
 // ---- Stripe webhook BEFORE body parsers ----
 app.use('/api', stripeWebhookRoutes);

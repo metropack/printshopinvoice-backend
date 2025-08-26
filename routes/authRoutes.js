@@ -5,54 +5,69 @@ const jwt = require('jsonwebtoken');
 const Stripe = require('stripe');
 
 const router = express.Router();
-
-// ✅ shared DB pool (do NOT create new Pool instances in routes)
 const pool = require('../db');
-
-// utils
+const authenticate = require('../middleware/authenticate');
+// optional: seed defaults for a new user
 const { copyDefaultVariationsToUser } = require('../middleware/utils/seedUtils');
 
-// auth middleware to read/verify JWT and set req.user
-const authenticate = require('../middleware/authenticate');
-
-// env
+// ---- env ----
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
 const stripe = STRIPE_SECRET_KEY ? Stripe(STRIPE_SECRET_KEY) : null;
+
+// Small helper
+const normalizeEmail = (e) => String(e || '').trim().toLowerCase();
 
 /**
  * POST /api/auth/register
- * Registers a user and seeds default product variations.
+ * Body: { email, password }
+ * Creates the user (subscription_status = 'inactive'), seeds defaults,
+ * and returns a JWT so the user is logged in immediately.
  */
 router.post('/register', async (req, res) => {
-  const { email = '', password = '' } = req.body;
+  const email = normalizeEmail(req.body.email);
+  const password = String(req.body.password || '');
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
 
   try {
-    // optional: enforce unique emails at DB level too
-    const exists = await pool.query('SELECT 1 FROM users WHERE email = $1', [email]);
+    const exists = await pool.query(
+      'SELECT 1 FROM users WHERE lower(email) = lower($1)',
+      [email]
+    );
     if (exists.rowCount > 0) {
       return res.status(409).json({ error: 'Email already registered' });
     }
 
     const hash = await bcrypt.hash(password, 10);
-    const result = await pool.query(
+    const { rows } = await pool.query(
       `INSERT INTO users (email, password_hash, subscription_status)
-       VALUES ($1, $2, $3)
-       RETURNING id`,
-      [email, hash, 'inactive']
+       VALUES ($1, $2, 'inactive')
+       RETURNING id, email, subscription_status`,
+      [email, hash]
     );
 
-    const userId = result.rows[0].id;
+    const user = rows[0];
 
-    // Seed default variations for this user (non-fatal)
+    // Seed defaults (non-fatal)
     try {
-      await copyDefaultVariationsToUser(userId);
-    } catch (seedErr) {
-      console.warn('Seed defaults failed for user', userId, seedErr.message);
+      await copyDefaultVariationsToUser(user.id);
+    } catch (err) {
+      console.warn('Seed defaults failed for user', user.id, err.message);
     }
 
-    res.status(201).json({ message: 'Registered successfully', userId });
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.status(201).json({
+      message: 'Registered successfully',
+      token,
+      userId: user.id,
+      subscription_status: user.subscription_status,
+    });
   } catch (err) {
     console.error('Register failed:', err);
     res.status(500).json({ error: 'Registration failed' });
@@ -61,14 +76,15 @@ router.post('/register', async (req, res) => {
 
 /**
  * POST /api/auth/login
- * Returns JWT token + userId.
+ * Body: { email, password }
+ * Returns JWT token + user info.
  */
 router.post('/login', async (req, res) => {
-  const email = (req.body.email || '').trim();
-  const password = req.body.password || '';
+  const email = normalizeEmail(req.body.email);
+  const password = String(req.body.password || '');
 
   try {
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    const result = await pool.query('SELECT * FROM users WHERE lower(email) = lower($1)', [email]);
     const user = result.rows[0];
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
@@ -90,11 +106,10 @@ router.post('/login', async (req, res) => {
 
 /**
  * GET /api/auth/me
- * Validate current token, return basic user info (used for auto-login).
+ * Requires Authorization: Bearer <token>
  */
 router.get('/me', authenticate, async (req, res) => {
   try {
-    // Optionally read more fields if you want:
     const { rows } = await pool.query(
       'SELECT id, email, subscription_status FROM users WHERE id = $1',
       [req.user.id]
@@ -110,7 +125,7 @@ router.get('/me', authenticate, async (req, res) => {
 
 /**
  * GET /api/auth/license-check
- * Verifies the token and returns subscription status.
+ * Reads token from Authorization header, returns { subscription_active: boolean }.
  */
 router.get('/license-check', async (req, res) => {
   const authHeader = req.headers.authorization || '';
@@ -132,39 +147,58 @@ router.get('/license-check', async (req, res) => {
 
 /**
  * POST /api/auth/create-checkout-session
- * Creates a Stripe subscription checkout session.
+ * Requires Authorization: Bearer <token>
+ * Creates/reuses a Stripe Customer for the logged-in user and starts a subscription checkout.
  */
-router.post('/create-checkout-session', async (req, res) => {
-  if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
-
-  const { email } = req.body;
+router.post('/create-checkout-session', authenticate, async (req, res) => {
   try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured' });
+    if (!STRIPE_PRICE_ID) return res.status(500).json({ error: 'Missing STRIPE_PRICE_ID' });
+
+    const userId = req.user.id;
+
+    // Fetch user
+    const { rows } = await pool.query(
+      'SELECT email, stripe_customer_id FROM users WHERE id = $1',
+      [userId]
+    );
+    const user = rows[0];
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    // Create or reuse Customer
+    let customerId = user.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        metadata: { userId: String(userId) },
+      });
+      customerId = customer.id;
+      await pool.query(
+        'UPDATE users SET stripe_customer_id = $1 WHERE id = $2',
+        [customerId, userId]
+      );
+    }
+
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
       mode: 'subscription',
-      customer_email: email,
-      line_items: [
-        {
-          // TODO: move price id to env
-          price: 'price_1RcGLnPHwSvABIr8pvE36lWS',
-          quantity: 1,
-        },
-      ],
-      success_url: `${FRONTEND_URL}/success`,
-      cancel_url: `${FRONTEND_URL}/cancel`,
+      customer: customerId,
+      line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
+      // we recommend /success.html & /cancel.html (you created those)
+      success_url: `${FRONTEND_URL}/success.html`,
+      cancel_url:  `${FRONTEND_URL}/cancel.html`,
+      // these let the webhook link the event → user
+      client_reference_id: String(userId),
+      metadata: { userId: String(userId) },
     });
+
     res.json({ url: session.url });
   } catch (err) {
-    console.error('Stripe session failed:', err);
+    console.error('Stripe session failed:', err?.message || err);
     res.status(500).json({ error: 'Stripe session failed' });
   }
 });
 
-// ⚠️ Webhook is in a dedicated file (routes/stripeWebhook.js)
-
-/**
- * GET /api/auth/test
- */
+/** Simple health check */
 router.get('/test', (_req, res) => {
   res.json({ message: 'Auth route working' });
 });
