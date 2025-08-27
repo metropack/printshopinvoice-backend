@@ -3,6 +3,8 @@ const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const Stripe = require('stripe');
+const crypto = require('crypto');
+const { Resend } = require('resend');
 
 const router = express.Router();
 
@@ -21,6 +23,32 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+// email (password reset)
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const FROM_EMAIL = process.env.FROM_EMAIL || 'no-reply@example.com';
+
+// ---- helpers for password reset ----
+function makeToken() {
+  return crypto.randomBytes(32).toString('hex'); // plaintext token (emailed)
+}
+function hashToken(t) {
+  return crypto.createHash('sha256').update(t).digest('hex'); // stored hash
+}
+async function sendResetEmail(to, link) {
+  if (!resend) throw new Error('Email not configured');
+  await resend.emails.send({
+    from: FROM_EMAIL,
+    to,
+    subject: 'Reset your MPS Invoice App password',
+    html: `
+      <p>We received a request to reset your password.</p>
+      <p><a href="${link}">Click here to reset your password</a></p>
+      <p>If you didn’t request this, you can ignore this email.</p>
+      <p>This link expires in 60 minutes.</p>
+    `,
+  });
+}
 
 /**
  * POST /api/auth/register
@@ -133,8 +161,6 @@ router.get('/license-check', async (req, res) => {
  * Creates a Stripe subscription checkout session
  * If a token is provided, we use userId as client_reference_id
  */
-// POST /api/auth/create-checkout-session
-// Create Stripe Checkout Session (subscription)
 router.post('/create-checkout-session', async (req, res) => {
   if (!stripe) {
     console.error('Stripe not configured: missing STRIPE_SECRET_KEY');
@@ -186,6 +212,7 @@ router.post('/create-checkout-session', async (req, res) => {
   }
 });
 
+// simple Stripe diagnostics
 router.get('/diag/stripe', async (_req, res) => {
   if (!stripe) return res.status(500).json({ ok: false, error: 'Stripe not configured' });
   try {
@@ -206,8 +233,78 @@ router.get('/diag/stripe', async (_req, res) => {
   }
 });
 
+/**
+ * POST /api/auth/password/forgot { email }
+ * Always returns ok (to avoid email enumeration).
+ */
+router.post('/password/forgot', async (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: 'Email required' });
 
+  try {
+    const { rows } = await pool.query('SELECT id FROM users WHERE lower(email)=$1', [email]);
+    const user = rows[0];
 
+    // Always pretend success
+    if (!user) return res.json({ ok: true });
+
+    // optional: ensure table exists separately (migration)
+    const token = makeToken();
+    const tokenHash = hashToken(token);
+    const expires = new Date(Date.now() + 60 * 60 * 1000); // 60 minutes
+
+    await pool.query('DELETE FROM password_reset_tokens WHERE user_id=$1', [user.id]);
+    await pool.query(
+      `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+       VALUES ($1, $2, $3)`,
+      [user.id, tokenHash, expires]
+    );
+
+    const link = `${FRONTEND_URL}/reset.html?token=${encodeURIComponent(token)}`;
+    try { await sendResetEmail(email, link); } catch (e) {
+      console.warn('sendResetEmail failed:', e.message);
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('password/forgot error:', e.message);
+    return res.json({ ok: true });
+  }
+});
+
+/**
+ * POST /api/auth/password/reset { token, password }
+ */
+router.post('/password/reset', async (req, res) => {
+  const token = (req.body.token || '').trim();
+  const password = req.body.password || '';
+  if (!token || password.length < 6) {
+    return res.status(400).json({ error: 'Invalid token or password too short' });
+  }
+
+  try {
+    const tokenHash = hashToken(token);
+    const { rows } = await pool.query(
+      `SELECT prt.user_id
+         FROM password_reset_tokens prt
+        WHERE prt.token_hash = $1
+          AND prt.expires_at > now()
+        LIMIT 1`,
+      [tokenHash]
+    );
+    const found = rows[0];
+    if (!found) return res.status(400).json({ error: 'Invalid or expired token' });
+
+    const hash = await bcrypt.hash(password, 10);
+    await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, found.user_id]);
+    await pool.query('DELETE FROM password_reset_tokens WHERE user_id=$1', [found.user_id]);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('password/reset error:', e.message);
+    return res.status(500).json({ error: 'Reset failed' });
+  }
+});
 
 /**
  * GET /api/auth/test
