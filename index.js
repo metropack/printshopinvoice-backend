@@ -51,6 +51,10 @@ app.use('/api', stripeWebhookRoutes);
 
 /* ---------------- Body parsers ---------------- */
 app.use(express.json({ limit: '25mb' }));
+
+const passwordResetRoutes = require('./routes/passwordReset');
+app.use('/api/auth', passwordResetRoutes);
+
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 /* ---------------- Static assets ---------------- */
