@@ -119,7 +119,11 @@ router.post('/portal', async (req, res) => {
       type: err?.type,
       raw: err?.raw?.message,
     });
-    return res.status(500).json({ error: 'Failed to start Billing Portal' });
+    // send the detail back so the UI can show it
+    return res.status(500).json({
+      error: 'Failed to start Billing Portal',
+      detail: err?.raw?.message || err?.message || null
+    });
   }
 });
 
