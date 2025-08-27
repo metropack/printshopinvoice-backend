@@ -1,105 +1,89 @@
-// routes/billing.js
+// backend/routes/billing.js
 const express = require('express');
-const router = express.Router();
-const pool = require('../db');
-const authenticate = require('../middleware/authenticate');
 const Stripe = require('stripe');
+const pool = require('../db');
 
+const router = express.Router();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://mps-site-rouge.vercel.app';
 
-router.use(authenticate);
-
-// Return subscription status + period end + cancel flag
-router.get('/status', async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT subscription_status, stripe_customer_id, stripe_subscription_id
-         FROM users WHERE id=$1`,
-      [req.user.id]
-    );
-    const u = rows[0];
-    if (!u) return res.status(404).json({ error: 'User not found' });
-
-    const resp = {
-      subscription_status: u.subscription_status || 'inactive',
-      cancel_at_period_end: false,
-      current_period_end: null
-    };
-
-    if (u.stripe_subscription_id) {
-      const sub = await stripe.subscriptions.retrieve(u.stripe_subscription_id);
-      resp.cancel_at_period_end = sub.cancel_at_period_end;
-      resp.current_period_end = sub.current_period_end;
-    }
-    res.json(resp);
-  } catch (e) {
-    res.status(500).json({ error: 'Failed to load billing status' });
-  }
-});
-
-// Stripe Customer Portal
+// Start Stripe Customer Portal
 router.post('/portal', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT email, stripe_customer_id FROM users WHERE id=$1`,
+      'SELECT email, stripe_customer_id FROM users WHERE id = $1',
       [req.user.id]
     );
-    const u = rows[0];
-    if (!u) return res.status(404).json({ error: 'User not found' });
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: 'User not found' });
 
-    let customerId = u.stripe_customer_id;
+    let { email, stripe_customer_id: customerId } = row;
+
+    // Fallback: look up by email and persist if we never saved it
     if (!customerId) {
-      // create a customer if we don't have one yet
-      const c = await stripe.customers.create({ email: u.email });
-      customerId = c.id;
+      const list = await stripe.customers.list({ email, limit: 1 });
+      customerId = list.data[0]?.id;
+      if (!customerId) return res.status(400).json({ error: 'No Stripe customer on file' });
+
       await pool.query(
-        `UPDATE users SET stripe_customer_id=$1 WHERE id=$2`,
-        [customerId, req.user.id]
+        'UPDATE users SET stripe_customer_id = $2 WHERE id = $1',
+        [req.user.id, customerId]
       );
     }
 
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,
-      return_url: `${FRONTEND_URL}/account.html`
+      return_url: `${FRONTEND_URL}/account.html`,
     });
+
     res.json({ url: session.url });
-  } catch (e) {
+  } catch (err) {
+    console.error('billing/portal error:', err?.message || err);
     res.status(500).json({ error: 'Failed to start Billing Portal' });
   }
 });
 
-// Cancel at next period end
+// Cancel at period end
 router.post('/cancel', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT stripe_subscription_id FROM users WHERE id=$1`,
+      'SELECT stripe_customer_id FROM users WHERE id = $1',
       [req.user.id]
     );
-    const subId = rows[0]?.stripe_subscription_id;
-    if (!subId) return res.status(400).json({ error: 'No active subscription' });
+    const customerId = rows[0]?.stripe_customer_id;
+    if (!customerId) return res.status(400).json({ error: 'No Stripe customer on file' });
 
-    await stripe.subscriptions.update(subId, { cancel_at_period_end: true });
+    const subs = await stripe.subscriptions.list({ customer: customerId, limit: 1 });
+    const sub = subs.data[0];
+    if (!sub) return res.status(400).json({ error: 'No active subscription found' });
+
+    await stripe.subscriptions.update(sub.id, { cancel_at_period_end: true });
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed to cancel at period end' });
+  } catch (err) {
+    console.error('billing/cancel error:', err?.message || err);
+    res.status(500).json({ error: 'Unable to update subscription' });
   }
 });
 
-// Resume (unset cancel_at_period_end)
+// Resume subscription
 router.post('/resume', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT stripe_subscription_id FROM users WHERE id=$1`,
+      'SELECT stripe_customer_id FROM users WHERE id = $1',
       [req.user.id]
     );
-    const subId = rows[0]?.stripe_subscription_id;
-    if (!subId) return res.status(400).json({ error: 'No subscription' });
+    const customerId = rows[0]?.stripe_customer_id;
+    if (!customerId) return res.status(400).json({ error: 'No Stripe customer on file' });
 
-    await stripe.subscriptions.update(subId, { cancel_at_period_end: false });
+    const subs = await stripe.subscriptions.list({ customer: customerId, status: 'active', limit: 1 });
+    const sub = subs.data[0];
+    if (!sub) return res.status(400).json({ error: 'No active subscription found' });
+
+    await stripe.subscriptions.update(sub.id, { cancel_at_period_end: false });
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: 'Failed to resume subscription' });
+  } catch (err) {
+    console.error('billing/resume error:', err?.message || err);
+    res.status(500).json({ error: 'Unable to resume subscription' });
   }
 });
 
