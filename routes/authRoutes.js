@@ -306,6 +306,43 @@ router.post('/password/reset', async (req, res) => {
   }
 });
 
+// Change password (must be signed in)
+router.post('/change-password', authenticate, async (req, res) => {
+  try {
+    const { currentPassword = '', newPassword = '' } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current and new password are required' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    }
+
+    const { rows } = await pool.query(
+      'SELECT password_hash FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const user = rows[0];
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const ok = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!ok) return res.status(400).json({ error: 'Current password is incorrect' });
+
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, req.user.id]);
+
+    // Optional: force re-login by returning a flag
+    return res.json({ ok: true, message: 'Password changed' });
+  } catch (err) {
+    console.error('change-password failed:', err);
+    return res.status(500).json({ error: 'Failed to change password' });
+  }
+});
+
+
+
+
+
 /**
  * GET /api/auth/test
  */
