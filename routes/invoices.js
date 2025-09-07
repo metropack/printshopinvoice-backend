@@ -1,4 +1,4 @@
-// routes/invoices.js
+// backend/routes/invoices.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
@@ -187,11 +187,14 @@ router.get('/', async (req, res) => {
       params = [userId];
     }
 
+    console.time('invoices-db');
     const invoices = await pool.query(sql, params);
+    console.timeEnd('invoices-db');
 
     // Include items (user-scoped join to prevent cross-user leakage)
     const data = [];
     for (const inv of invoices.rows) {
+      console.time(`invoice-items-${inv.id}`);
       const { rows: items } = await pool.query(
         `
         SELECT ii.quantity, ii.price, ii.taxable
@@ -206,6 +209,7 @@ router.get('/', async (req, res) => {
         `,
         [inv.id, userId]
       );
+      console.timeEnd(`invoice-items-${inv.id}`);
 
       data.push({ ...inv, items });
     }
