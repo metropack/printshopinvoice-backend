@@ -3,8 +3,7 @@ const path = require('path');
 
 // Load .env from backend/.env explicitly (local). On Render, dashboard envs still win.
 require('dotenv').config({ path: path.join(__dirname, '.env') });
-console.log('[boot] loaded .env from', path.join(__dirname, '.env'));
-console.log('[boot] CWD =', process.cwd());
+
 
 const express = require('express');
 const cors = require('cors');
@@ -39,7 +38,7 @@ app.options('*', cors(corsOptions));
 
 /* ───────────────────────── Early request log ───────────────────────── */
 app.use((req, _res, next) => {
-  console.log(`[req] ${req.method} ${req.originalUrl}`);
+
   next();
 });
 
@@ -60,7 +59,7 @@ app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 // Debug/diagnostic routes (no auth). Keep while debugging, remove later.
 app.use('/api/_debug', require('./routes/diag'));
-console.log('[boot] diag router mounted at /api/_debug');
+
 
 /* ───────────────────────── Static ───────────────────────── */
 app.use('/invoices', express.static(p.join(__dirname, 'invoices')));
@@ -96,7 +95,7 @@ app.use('/api/billing',  authenticate, billingRoutes);
 // Everything else remains unchanged.
 const useGuard = process.env.BYPASS_SUB_GUARD !== '1';
 if (useGuard) {
-  console.log('[boot] subscriptionGuard ON for /api/products and /api/invoices');
+
   app.use('/api/products',    authenticate, subscriptionGuard, productsRoutes);
   app.use('/api/invoices',    authenticate, subscriptionGuard, invoicesRoutes);
 } else {

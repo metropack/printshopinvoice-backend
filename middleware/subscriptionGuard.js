@@ -36,7 +36,7 @@ module.exports = async function subscriptionGuard(req, res, next) {
     const status = (rows?.[0]?.subscription_status || '').toLowerCase();
 
     console.timeEnd(`[sub-guard] uid=${uid}`);
-    console.log(`[sub-guard] uid=${uid} status="${status}"`);
+    
 
     // Consider both active and trialing as allowed
     if (status === 'active' || status === 'trialing') {

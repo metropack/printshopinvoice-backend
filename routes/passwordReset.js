@@ -7,14 +7,18 @@ const pool = require('../db');
 
 const router = express.Router();
 
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://mps-site-rouge.vercel.app';
+// Use env in production; local fallback for dev
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 const RESET_TOKEN_TTL_HOURS = parseInt(process.env.RESET_TOKEN_TTL_HOURS || '2', 10);
+
+// Strong password rule: ≥8 chars, at least one letter, one number, one special character
+const PASSWORD_RE = /^(?=.*[A-Za-z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
 
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
 
-// Email transporter (optional)
+// Optional SMTP transporter
 let transporter = null;
 if (process.env.SMTP_HOST) {
   transporter = nodemailer.createTransport({
@@ -79,8 +83,12 @@ router.post('/request-password-reset', async (req, res) => {
 router.post('/reset-password', async (req, res) => {
   const { token = '', password = '' } = req.body;
 
-  if (!token || !password || password.length < 6) {
-    return res.status(400).json({ error: 'Invalid request' });
+  // Enforce strong password here
+  if (!token || !PASSWORD_RE.test(password)) {
+    return res.status(400).json({
+      error:
+        'Invalid request. Password must be at least 8 characters and include a letter, a number, and a special character.',
+    });
   }
 
   const tokenHash = hashToken(token);

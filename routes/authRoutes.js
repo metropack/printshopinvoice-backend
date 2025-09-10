@@ -50,6 +50,9 @@ async function sendResetEmail(to, link) {
   });
 }
 
+// 🔐 Password policy: ≥8 chars, at least 1 letter, 1 number, 1 special char
+const PASSWORD_RE = /^(?=.*[A-Za-z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
+
 /**
  * POST /api/auth/register
  * Create user, seed defaults, return token + userId
@@ -60,6 +63,14 @@ router.post('/register', async (req, res) => {
   try {
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
+    }
+
+    // ✅ Enforce strong password
+    if (!PASSWORD_RE.test(password)) {
+      return res.status(400).json({
+        error:
+          'Password must be at least 8 characters and include a letter, a number, and a special character.',
+      });
     }
 
     const exists = await pool.query('SELECT 1 FROM users WHERE lower(email)=lower($1)', [email]);
@@ -278,8 +289,13 @@ router.post('/password/forgot', async (req, res) => {
 router.post('/password/reset', async (req, res) => {
   const token = (req.body.token || '').trim();
   const password = req.body.password || '';
-  if (!token || password.length < 6) {
-    return res.status(400).json({ error: 'Invalid token or password too short' });
+
+  // ✅ apply strong-password rule here as well
+  if (!token || !PASSWORD_RE.test(password)) {
+    return res.status(400).json({
+      error:
+        'Invalid token or weak password. Use at least 8 characters including a letter, a number, and a special character.',
+    });
   }
 
   try {
@@ -314,8 +330,12 @@ router.post('/change-password', authenticate, async (req, res) => {
     if (!currentPassword || !newPassword) {
       return res.status(400).json({ error: 'Current and new password are required' });
     }
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    // ✅ enforce strong-password rule
+    if (!PASSWORD_RE.test(newPassword)) {
+      return res.status(400).json({
+        error:
+          'New password must be at least 8 characters and include a letter, a number, and a special character.',
+      });
     }
 
     const { rows } = await pool.query(
@@ -331,17 +351,12 @@ router.post('/change-password', authenticate, async (req, res) => {
     const hash = await bcrypt.hash(newPassword, 10);
     await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hash, req.user.id]);
 
-    // Optional: force re-login by returning a flag
     return res.json({ ok: true, message: 'Password changed' });
   } catch (err) {
     console.error('change-password failed:', err);
     return res.status(500).json({ error: 'Failed to change password' });
   }
 });
-
-
-
-
 
 /**
  * GET /api/auth/test
