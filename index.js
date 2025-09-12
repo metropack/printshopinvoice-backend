@@ -1,4 +1,3 @@
-// backend/index.js
 const path = require('path');
 
 // Load .env from backend/.env explicitly (local). On Render, dashboard envs still win.
