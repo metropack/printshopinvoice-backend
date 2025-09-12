@@ -1,133 +1,123 @@
 // backend/index.js
 const path = require('path');
-
-// Load .env from backend/.env explicitly (local). On Render, dashboard envs still win.
-require('dotenv').config({ path: path.join(__dirname, '.env') });
-
-
 const express = require('express');
 const cors = require('cors');
-const p = require('path');
-// const morgan = require('morgan');
+
+// Load .env from backend/.env explicitly (local). On Render, dashboard envs take precedence.
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 app.set('trust proxy', 1);
 
-/* ───────────────────────── CORS (relaxed for now) ───────────────────────── */
-const allowed = (process.env.ALLOWED_ORIGINS || '')
+/* ───────────────────────── CORS Configuration ───────────────────────── */
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
-  .filter(Boolean);
+  .filter(Boolean)
+  .concat(['http://localhost:3000', 'file://']); // Explicitly allow Electron and dev
 
-// “allow all” while debugging if no ALLOWED_ORIGINS set
 const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true);                 // curl / server-to-server
-    if (allowed.length === 0) return cb(null, true);    // debug: allow all
-    if (allowed.includes(origin)) return cb(null, true);
-    if (origin === 'null') return cb(null, true);       // file:// (Electron)
+    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin) || origin === 'null') {
+      return cb(null, true); // Allow curl, Electron (file://), or if no origins set
+    }
     return cb(new Error(`Not allowed by CORS: ${origin}`));
   },
   credentials: true,
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 };
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
-/* ───────────────────────── Early request log ───────────────────────── */
-app.use((req, _res, next) => {
-
+/* ───────────────────────── Request Logging ───────────────────────── */
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    console.log(`${req.method} ${req.originalUrl} - ${res.statusCode} in ${Date.now() - start}ms`);
+  });
   next();
 });
 
-/* ───────────────────────── Liveness (NO AUTH) ───────────────────────── */
+/* ───────────────────────── Liveness Endpoints (No Auth) ───────────────────────── */
 app.get('/api/ping', (_req, res) => res.json({ ok: true, at: '/api/ping', t: Date.now() }));
-app.get('/__up',      (_req, res) => res.json({ ok: true, at: '/__up',      t: Date.now() }));
+app.get('/__up', (_req, res) => res.json({ ok: true, at: '/__up', t: Date.now() }));
 
-/* ───────────────────────── Stripe webhook (raw body) ─────────────────────────
-   IMPORTANT: mount this precisely so it cannot catch all of /api/*
---------------------------------------------------------------------------- */
+/* ───────────────────────── Stripe Webhook (Raw Body) ───────────────────────── */
 const stripeWebhook = require('./routes/stripeWebhook');
 app.use('/api/webhook', stripeWebhook);
 
-/* ───────────────────────── Body parsers & access log ───────────────────────── */
+/* ───────────────────────── Body Parsers ───────────────────────── */
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
-// app.use(morgan('tiny'));
 
-// Debug/diagnostic routes (no auth). Keep while debugging, remove later.
+/* ───────────────────────── Static File Serving ───────────────────────── */
+app.use('/invoices', express.static(path.join(__dirname, 'invoices')));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+/* ───────────────────────── Debug Routes (No Auth) ───────────────────────── */
 app.use('/api/_debug', require('./routes/diag'));
 
-
-/* ───────────────────────── Static ───────────────────────── */
-app.use('/invoices', express.static(p.join(__dirname, 'invoices')));
-app.use('/uploads',  express.static(p.join(__dirname, 'uploads')));
-
 /* ───────────────────────── Routes ───────────────────────── */
-const authRoutes        = require('./routes/authRoutes');
-const passwordReset     = require('./routes/passwordReset');
+const authRoutes = require('./routes/authRoutes');
+const passwordReset = require('./routes/passwordReset');
+const estimatesRoutes = require('./routes/estimates');
+const invoicesRoutes = require('./routes/invoices');
+const customersRoutes = require('./routes/customers');
+const productsRoutes = require('./routes/products');
+const reportsRoutes = require('./routes/reports');
+const customTabsRoutes = require('./routes/customTabs');
+const storeInfoRoutes = require('./routes/storeInfoRoutes');
+const profileRoutes = require('./routes/profile');
+const billingRoutes = require('./routes/billing');
 
-const estimatesRoutes   = require('./routes/estimates');
-const invoicesRoutes    = require('./routes/invoices');
-const customersRoutes   = require('./routes/customers');
-const productsRoutes    = require('./routes/products');
-const reportsRoutes     = require('./routes/reports');
-const customTabsRoutes  = require('./routes/customTabs');
-const storeInfoRoutes   = require('./routes/storeInfoRoutes');
-const profileRoutes     = require('./routes/profile');
-const billingRoutes     = require('./routes/billing');
-
-const authenticate      = require('./middleware/authenticate');
+const authenticate = require('./middleware/authenticate');
 const subscriptionGuard = require('./middleware/subscriptionGuard');
 
-/* public */
+/* Public Routes */
 app.use('/api/auth', passwordReset);
 app.use('/api/auth', authRoutes);
 
-/* protected (require auth; most also require active subscription) */
-app.use('/api/profile',  authenticate, profileRoutes);
-app.use('/api/billing',  authenticate, billingRoutes);
+/* Protected Routes (Require Auth) */
+app.use('/api/profile', authenticate, profileRoutes);
+app.use('/api/billing', authenticate, billingRoutes);
 
-// ── TEMPORARY TOGGLE: allow bypassing subscriptionGuard for targeted routes ──
-// Set BYPASS_SUB_GUARD=1 in env to mount these routes without the guard.
-// Everything else remains unchanged.
+/* Conditional Subscription Guard */
 const useGuard = process.env.BYPASS_SUB_GUARD !== '1';
 if (useGuard) {
-
-  app.use('/api/products',    authenticate, subscriptionGuard, productsRoutes);
-  app.use('/api/invoices',    authenticate, subscriptionGuard, invoicesRoutes);
+  console.log('[boot] Using subscriptionGuard for protected routes');
+  app.use('/api/products', authenticate, subscriptionGuard, productsRoutes);
+  app.use('/api/invoices', authenticate, subscriptionGuard, invoicesRoutes);
 } else {
-  console.warn('[boot] BYPASS_SUB_GUARD=1 → mounting /api/products & /api/invoices WITHOUT subscriptionGuard');
-  app.use('/api/products',    authenticate, productsRoutes);
-  app.use('/api/invoices',    authenticate, invoicesRoutes);
+  console.warn('[boot] BYPASS_SUB_GUARD=1 → Mounting /api/products & /api/invoices WITHOUT subscriptionGuard');
+  app.use('/api/products', authenticate, productsRoutes);
+  app.use('/api/invoices', authenticate, invoicesRoutes);
 }
 
-// All the rest keep the guard as before
-app.use('/api/estimates',   authenticate, subscriptionGuard, estimatesRoutes);
-app.use('/api/customers',   authenticate, subscriptionGuard, customersRoutes);
-app.use('/api/reports',     authenticate, subscriptionGuard, reportsRoutes);
+/* Other Protected Routes (Always with Subscription Guard) */
+app.use('/api/estimates', authenticate, subscriptionGuard, estimatesRoutes);
+app.use('/api/customers', authenticate, subscriptionGuard, customersRoutes);
+app.use('/api/reports', authenticate, subscriptionGuard, reportsRoutes);
 app.use('/api/custom_tabs', authenticate, subscriptionGuard, customTabsRoutes);
-app.use('/api/store-info',  authenticate, subscriptionGuard, storeInfoRoutes);
+app.use('/api/store-info', authenticate, subscriptionGuard, storeInfoRoutes);
 
-/* root */
+/* Root and Favicon */
 app.get('/', (_req, res) => res.send('Backend is working!'));
 app.get('/favicon.ico', (_req, res) => res.sendStatus(204));
 
-/* ───────────────────────── 404 & error JSON ───────────────────────── */
-app.use((req, res, _next) => {
+/* ───────────────────────── 404 & Error Handling ───────────────────────── */
+app.use((req, res) => {
   res.status(404).json({ error: 'Not found', path: req.originalUrl });
 });
 
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err);
-  res
-    .status(err.status || err.statusCode || 500)
-    .json({ error: err.message || 'Server error' });
+  res.status(err.status || err.statusCode || 500).json({
+    error: err.message || 'Server error',
+  });
 });
 
-/* ───────────────────────── start ───────────────────────── */
+/* ───────────────────────── Start Server ───────────────────────── */
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server is live on port ${PORT}`);
