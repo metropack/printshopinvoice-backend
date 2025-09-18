@@ -5,6 +5,11 @@ const nodemailer = require('nodemailer');
 
 function isEmail(s=''){ return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim()); }
 
+
+// quick GET so we can confirm the router is mounted in prod
+console.log('[boot] support router loaded');
+router.get('/support/health', (_req, res) => res.json({ ok: true }));
+
 router.post('/support', async (req, res) => {
   try {
     const { name='', email='', company='', phone='', subject='', message='', type='support' } = req.body || {};

@@ -63,6 +63,8 @@ app.use('/api/_debug', require('./routes/diag'));
 /* ───────────────────────── Static ───────────────────────── */
 app.use('/invoices', express.static(p.join(__dirname, 'invoices')));
 app.use('/uploads',  express.static(p.join(__dirname, 'uploads')));
+const supportRoutes = require('./routes/support');
+app.use('/api', supportRoutes);  // <-- gives you /api/support
 
 /* ───────────────────────── Routes ───────────────────────── */
 const authRoutes        = require('./routes/authRoutes');
