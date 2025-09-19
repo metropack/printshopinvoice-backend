@@ -42,7 +42,7 @@ router.post('/support', async (req, res) => {
       from: FROM_EMAIL,
       to: email,
       subject: `We received your ${prettyType.toLowerCase()} request`,
-      text: `Hi${name ? ' ' + name : ''},\n\nThanks for reaching out. We received your ${prettyType.toLowerCase()} request and will respond as soon as possible.\n\n— MPS Inc Support`
+      text: `Hi${name ? ' ' + name : ''},\n\nThanks for reaching out. We received your ${prettyType.toLowerCase()} request and will respond as soon as possible.\n\n— Printshopinvoice Support`
     });
 
     res.json({ ok: true });
