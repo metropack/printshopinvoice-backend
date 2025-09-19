@@ -5,21 +5,30 @@ const nodemailer = require('nodemailer');
 
 const isEmail = (s = '') => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
 
-// Build a transport that works for both 465(SSL) and 587(STARTTLS)
+// Build a transport that works for both 465 (SSL) and 587 (STARTTLS)
 function makeTransport() {
   const port = Number(process.env.SMTP_PORT || 587);
   const secure =
     port === 465 ||
-    String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true'; // explicit override if you want
+    String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true';
 
-  return nodemailer.createTransport({
-    host: process.env.SMTP_HOST,            // e.g. smtp.hostinger.com
+  const base = {
+    host: process.env.SMTP_HOST,           // smtp.hostinger.com
     port,
-    secure,                                 // 465 => true, 587 => false
+    secure,                                // 465 => true, 587 => false
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    requireTLS: !secure,                    // request STARTTLS on 587
-    tls: { minVersion: 'TLSv1.2' },         // harden TLS a bit
-  });
+    requireTLS: !secure,                   // request STARTTLS when using 587
+    tls: { minVersion: 'TLSv1.2' },
+  };
+
+  // Optional: turn on verbose SMTP logs if SMTP_DEBUG=1
+  if (String(process.env.SMTP_DEBUG || '0') === '1') {
+    base.logger = true;
+    base.debug = true;
+    console.log('[smtp]', { host: base.host, port: base.port, secure: base.secure });
+  }
+
+  return nodemailer.createTransport(base);
 }
 
 router.post('/support', async (req, res) => {
@@ -40,16 +49,19 @@ router.post('/support', async (req, res) => {
 
     const transporter = makeTransport();
 
-    const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
-    const FROM_EMAIL = process.env.FROM_EMAIL || process.env.SMTP_USER;
-    const MAILBOX = process.env.SMTP_USER; // ensure envelope uses your domain mailbox
-    const prettyType = type === 'contact' ? 'Contact Us' : 'Support';
+    // Verify we can reach the SMTP server (useful while stabilizing)
+    await transporter.verify();
 
-    // ---- Notify admin ----
+    const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+    const FROM_EMAIL  = process.env.FROM_EMAIL || process.env.SMTP_USER; // header From
+    const MAILBOX     = process.env.SMTP_USER;                           // envelope MAIL FROM
+    const prettyType  = type === 'contact' ? 'Contact Us' : 'Support';
+
+    // 1) Notify admin
     await transporter.sendMail({
-      from: FROM_EMAIL,                     // header From (shown to recipient)
-      sender: MAILBOX,                      // header Sender
-      envelope: { from: MAILBOX, to: ADMIN_EMAIL }, // SMTP MAIL FROM / RCPT TO
+      from: FROM_EMAIL,                           // header From (display)
+      sender: MAILBOX,                            // header Sender
+      envelope: { from: MAILBOX, to: ADMIN_EMAIL }, // SMTP MAIL FROM/RCPT TO
       to: ADMIN_EMAIL,
       replyTo: email,
       subject: `📨 ${prettyType} — ${subject || '(no subject)'} — ${email}`,
@@ -66,11 +78,11 @@ router.post('/support', async (req, res) => {
       ].join('\n'),
     });
 
-    // ---- Auto-reply to the requester ----
+    // 2) Auto-reply to the requester
     await transporter.sendMail({
       from: FROM_EMAIL,
       sender: MAILBOX,
-      envelope: { from: MAILBOX, to: email },
+      envelope: { from: MAILBOX, to: email },     // ensures Return-Path = your mailbox
       to: email,
       subject: `We received your ${prettyType.toLowerCase()} request`,
       text:
