@@ -3,7 +3,6 @@ const path = require('path');
 // Load .env from backend/.env explicitly (local). On Render, dashboard envs still win.
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
-
 const express = require('express');
 const cors = require('cors');
 const p = require('path');
@@ -59,7 +58,6 @@ app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 // Debug/diagnostic routes (no auth). Keep while debugging, remove later.
 app.use('/api/_debug', require('./routes/diag'));
 
-
 /* ───────────────────────── Static ───────────────────────── */
 app.use('/invoices', express.static(p.join(__dirname, 'invoices')));
 app.use('/uploads',  express.static(p.join(__dirname, 'uploads')));
@@ -96,7 +94,6 @@ app.use('/api/billing',  authenticate, billingRoutes);
 // Everything else remains unchanged.
 const useGuard = process.env.BYPASS_SUB_GUARD !== '1';
 if (useGuard) {
-
   app.use('/api/products',    authenticate, subscriptionGuard, productsRoutes);
   app.use('/api/invoices',    authenticate, subscriptionGuard, invoicesRoutes);
 } else {
@@ -111,6 +108,9 @@ app.use('/api/customers',   authenticate, subscriptionGuard, customersRoutes);
 app.use('/api/reports',     authenticate, subscriptionGuard, reportsRoutes);
 app.use('/api/custom_tabs', authenticate, subscriptionGuard, customTabsRoutes);
 app.use('/api/store-info',  authenticate, subscriptionGuard, storeInfoRoutes);
+
+/* ✅ Downloads (presigned S3) — mount BEFORE 404 */
+app.use('/api', require('./routes/downloads'));
 
 /* root */
 app.get('/', (_req, res) => res.send('Backend is working!'));
