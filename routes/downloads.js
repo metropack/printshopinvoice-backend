@@ -6,7 +6,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const router = express.Router();
 
 const s3 = new S3Client({ region: process.env.AWS_REGION });
-const bucket = process.env.DOWNLOADS_BUCKET;
+const bucket = process.env.S3_BUCKET;
 
 async function sign(key, filename) {
   const cmd = new GetObjectCommand({
