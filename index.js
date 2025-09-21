@@ -57,6 +57,7 @@ app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 // Debug/diagnostic routes (no auth). Keep while debugging, remove later.
 app.use('/api/_debug', require('./routes/diag'));
+app.use('/api/_debug', require('./routes/debugEmail'));
 
 /* ───────────────────────── Static ───────────────────────── */
 app.use('/invoices', express.static(p.join(__dirname, 'invoices')));
