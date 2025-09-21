@@ -46,7 +46,7 @@ async function sendResetEmail(toEmail, link) {
   }
 
   const headerFrom =
-    process.env.EMAIL_FROM || '"MPS Inc • Invoice App" <no-reply@printshopinvoice.com>';
+    process.env.EMAIL_FROM || '"Print Shop Invoice App" <no-reply@printshopinvoice.com>';
 
   // must match the authenticated mailbox (your real Hostinger mailbox)
   const sender = process.env.SMTP_USER || 'support@printshopinvoice.com';
