@@ -1,10 +1,69 @@
+// backend/routes/billing.js
 const express = require('express');
 const Stripe = require('stripe');
 const pool = require('../db');
 
 const router = express.Router();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://mps-site-rouge.vercel.app';
+
+// IMPORTANT: point this to your public website
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://printshopinvoice.com';
+
+/**
+ * POST /api/billing/checkout/start
+ * Create a Stripe Checkout session for a subscription and return the hosted url.
+ *
+ * This route should be PUBLIC (no auth) so your marketing/landing site can call it.
+ * If req.user exists, we include client_reference_id; otherwise we accept an email
+ * in the body and match/create a Stripe customer by email.
+ *
+ * Env required: STRIPE_PRICE_ID
+ */
+router.post('/checkout/start', async (req, res) => {
+  try {
+    const priceId = process.env.STRIPE_PRICE_ID;
+    if (!priceId) {
+      return res.status(500).json({ error: 'Missing STRIPE_PRICE_ID in environment' });
+    }
+
+    // If you mounted this router with auth, req.user will exist. If not, we accept email.
+    const userId = req.user?.id || null;
+    let email = (req.body?.email || '').trim().toLowerCase() || null;
+
+    // If authenticated but no email passed, load it from DB
+    if (userId && !email) {
+      const r = await pool.query('SELECT email FROM users WHERE id=$1', [userId]);
+      email = r.rows[0]?.email || null;
+    }
+
+    // Prepare (or find) a customer by email when we are not using an existing customer id
+    let customerId = null;
+    if (email) {
+      const list = await stripe.customers.list({ email, limit: 1 });
+      customerId = list.data[0]?.id || null;
+      if (!customerId) {
+        const c = await stripe.customers.create({ email });
+        customerId = c.id;
+      }
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: `${FRONTEND_URL}/login.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${FRONTEND_URL}/index.html?canceled=1`,
+      allow_promotion_codes: true,
+      billing_address_collection: 'auto',
+      ...(customerId ? { customer: customerId } : {}),
+      ...(userId ? { client_reference_id: String(userId) } : {}),
+    });
+
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error('billing/checkout/start error:', err?.message || err);
+    return res.status(500).json({ error: 'Failed to start checkout' });
+  }
+});
 
 /**
  * GET /api/billing/status
@@ -68,6 +127,7 @@ router.get('/status', async (req, res) => {
 /**
  * POST /api/billing/portal
  * Create a Stripe Customer Portal session.
+ * (Keep this behind auth.)
  */
 router.post('/portal', async (req, res) => {
   try {
