@@ -6,37 +6,32 @@ const pool = require('../db');
 const router = express.Router();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-// IMPORTANT: point this to your public website
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://printshopinvoice.com';
+// Use your real website; allow ENV override; strip trailing slash.
+const FRONTEND = (process.env.FRONTEND_URL || 'https://printshopinvoice.com').replace(/\/$/, '');
 
 /**
  * POST /api/billing/checkout/start
- * Create a Stripe Checkout session for a subscription and return the hosted url.
+ * Create a Stripe Checkout session for a subscription and return the hosted URL.
+ * Public route (no auth required). If req.user exists we include client_reference_id.
+ * If an email is provided (recommended), we match/create a Stripe customer by email.
  *
- * This route should be PUBLIC (no auth) so your marketing/landing site can call it.
- * If req.user exists, we include client_reference_id; otherwise we accept an email
- * in the body and match/create a Stripe customer by email.
- *
- * Env required: STRIPE_PRICE_ID
+ * Required env: STRIPE_PRICE_ID
  */
 router.post('/checkout/start', async (req, res) => {
   try {
     const priceId = process.env.STRIPE_PRICE_ID;
-    if (!priceId) {
-      return res.status(500).json({ error: 'Missing STRIPE_PRICE_ID in environment' });
-    }
+    if (!priceId) return res.status(500).json({ error: 'Missing STRIPE_PRICE_ID in environment' });
 
-    // If you mounted this router with auth, req.user will exist. If not, we accept email.
     const userId = req.user?.id || null;
     let email = (req.body?.email || '').trim().toLowerCase() || null;
 
-    // If authenticated but no email passed, load it from DB
+    // If authenticated but no email passed, load from DB
     if (userId && !email) {
-      const r = await pool.query('SELECT email FROM users WHERE id=$1', [userId]);
+      const r = await pool.query('SELECT email FROM users WHERE id = $1', [userId]);
       email = r.rows[0]?.email || null;
     }
 
-    // Prepare (or find) a customer by email when we are not using an existing customer id
+    // Prepare (or find) a customer by email
     let customerId = null;
     if (email) {
       const list = await stripe.customers.list({ email, limit: 1 });
@@ -50,14 +45,19 @@ router.post('/checkout/start', async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       line_items: [{ price: priceId, quantity: 1 }],
-      success_url: `${FRONTEND_URL}/login.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_URL}/index.html?canceled=1`,
+
+      // ✅ After successful payment, go to your website login with the paid banner
+      success_url: `${FRONTEND}/login.html?paid=1&session_id={CHECKOUT_SESSION_ID}`,
+      // Optional cancel fallback
+      cancel_url: `${FRONTEND}/signup.html?canceled=1`,
+
       allow_promotion_codes: true,
       billing_address_collection: 'auto',
       ...(customerId ? { customer: customerId } : {}),
       ...(userId ? { client_reference_id: String(userId) } : {}),
     });
 
+    console.log('✅ Checkout created. Success URL:', session.success_url);
     return res.json({ url: session.url });
   } catch (err) {
     console.error('billing/checkout/start error:', err?.message || err);
@@ -127,7 +127,6 @@ router.get('/status', async (req, res) => {
 /**
  * POST /api/billing/portal
  * Create a Stripe Customer Portal session.
- * (Keep this behind auth.)
  */
 router.post('/portal', async (req, res) => {
   try {
@@ -168,7 +167,7 @@ router.post('/portal', async (req, res) => {
 
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,
-      return_url: `${FRONTEND_URL}/account.html`,
+      return_url: `${FRONTEND}/account.html`,
     });
 
     return res.json({ url: session.url });
@@ -179,7 +178,6 @@ router.post('/portal', async (req, res) => {
       type: err?.type,
       raw: err?.raw?.message,
     });
-    // send the detail back so the UI can show it
     return res.status(500).json({
       error: 'Failed to start Billing Portal',
       detail: err?.raw?.message || err?.message || null

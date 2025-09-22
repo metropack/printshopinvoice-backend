@@ -1,3 +1,4 @@
+// backend/routes/authRoutes.js
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
@@ -6,12 +7,19 @@ const crypto = require('crypto');
 const { Resend } = require('resend');
 
 const router = express.Router();
+
+// shared DB pool
 const pool = require('../db');
+
+// optional seeding util
 const { copyDefaultVariationsToUser } = require('../middleware/utils/seedUtils');
+
+// auth middleware (for /me)
 const authenticate = require('../middleware/authenticate');
 
+// env
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://printshopinvoice.com';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
@@ -22,10 +30,10 @@ const FROM_EMAIL = process.env.FROM_EMAIL || 'no-reply@example.com';
 
 // ---- helpers for password reset ----
 function makeToken() {
-  return crypto.randomBytes(32).toString('hex');
+  return crypto.randomBytes(32).toString('hex'); // plaintext token (emailed)
 }
 function hashToken(t) {
-  return crypto.createHash('sha256').update(t).digest('hex');
+  return crypto.createHash('sha256').update(t).digest('hex'); // stored hash
 }
 async function sendResetEmail(to, link) {
   if (!resend) throw new Error('Email not configured');
@@ -42,11 +50,12 @@ async function sendResetEmail(to, link) {
   });
 }
 
-// 🔐 strong password: ≥8 chars, 1 letter, 1 number, 1 special char
+// 🔐 Password policy: ≥8 chars, at least 1 letter, 1 number, 1 special char
 const PASSWORD_RE = /^(?=.*[A-Za-z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
 
 /**
  * POST /api/auth/register
+ * Create user, seed defaults, return token + userId
  */
 router.post('/register', async (req, res) => {
   const { email = '', password = '' } = req.body;
@@ -55,6 +64,8 @@ router.post('/register', async (req, res) => {
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password required' });
     }
+
+    // ✅ Enforce strong password
     if (!PASSWORD_RE.test(password)) {
       return res.status(400).json({
         error:
@@ -76,7 +87,10 @@ router.post('/register', async (req, res) => {
     );
     const userId = result.rows[0].id;
 
-    try { await copyDefaultVariationsToUser(userId); } catch (_) {}
+    // best-effort seed
+    try {
+      await copyDefaultVariationsToUser(userId);
+    } catch (_) {}
 
     const token = jwt.sign({ id: userId, email }, JWT_SECRET, { expiresIn: '7d' });
     return res.status(201).json({ message: 'Registered successfully', userId, token });
@@ -88,6 +102,7 @@ router.post('/register', async (req, res) => {
 
 /**
  * POST /api/auth/login
+ * Validate credentials, return token + user fields
  */
 router.post('/login', async (req, res) => {
   const email = (req.body.email || '').trim();
@@ -155,83 +170,54 @@ router.get('/license-check', async (req, res) => {
 /**
  * POST /api/auth/create-checkout-session
  * Creates a Stripe subscription checkout session
- * Uses Authorization (if present) or email to associate the user.
+ * If a token is provided, we use userId as client_reference_id
  */
 router.post('/create-checkout-session', async (req, res) => {
   if (!stripe) {
     console.error('Stripe not configured: missing STRIPE_SECRET_KEY');
     return res.status(500).json({ error: 'Stripe not configured' });
   }
-  if (!STRIPE_PRICE_ID) {
+
+  const PRICE_ID = process.env.STRIPE_PRICE_ID;
+  const FRONTEND_URL = process.env.FRONTEND_URL || 'https://mps-site-rouge.vercel.app';
+
+  if (!PRICE_ID) {
     console.error('Missing STRIPE_PRICE_ID env var');
     return res.status(500).json({ error: 'Missing STRIPE_PRICE_ID' });
   }
 
-  // Prefer authenticated user if header present
-  const auth = (req.headers.authorization || '').trim();
-  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  let authedUserId = null;
-  if (bearer) {
-    try {
-      const decoded = jwt.verify(bearer, JWT_SECRET);
-      authedUserId = decoded?.id || null;
-    } catch (_) {}
-  }
-
   const { email = '' } = req.body;
   const normEmail = String(email).trim().toLowerCase();
-  if (!authedUserId && (!normEmail || !normEmail.includes('@'))) {
+  if (!normEmail || !normEmail.includes('@')) {
     return res.status(400).json({ error: 'Valid email required' });
   }
 
+  let userIdForSession = null;
   try {
-    // Resolve the user row
-    let userRow = null;
-    if (authedUserId) {
-      const q = await pool.query('SELECT id, email, stripe_customer_id FROM users WHERE id = $1', [authedUserId]);
-      userRow = q.rows[0] || null;
-    } else {
-      const q = await pool.query('SELECT id, email, stripe_customer_id FROM users WHERE lower(email) = lower($1)', [normEmail]);
-      userRow = q.rows[0] || null;
-    }
-    if (!userRow) return res.status(404).json({ error: 'User not found' });
+    const r = await pool.query('SELECT id FROM users WHERE lower(email) = $1', [normEmail]);
+    userIdForSession = r.rows[0]?.id || null;
+  } catch (dbErr) {
+    console.warn('Warning: could not lookup user id for client_reference_id:', dbErr.message);
+  }
 
-    const emailForStripe = userRow.email || normEmail;
-
-    // Ensure Stripe customer
-    let customerId = userRow.stripe_customer_id;
-    if (!customerId) {
-      // try reuse by email
-      const existing = await stripe.customers.list({ email: emailForStripe, limit: 1 });
-      customerId = existing.data[0]?.id;
-      if (!customerId) {
-        const created = await stripe.customers.create({ email: emailForStripe });
-        customerId = created.id;
-      }
-      await pool.query('UPDATE users SET stripe_customer_id=$2 WHERE id=$1', [userRow.id, customerId]);
-    }
-
-    // Build checkout session → success goes to website login with ?paid=1
+  try {
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer: customerId,
-      customer_email: emailForStripe,
-      client_reference_id: String(userRow.id),
-      metadata: { userId: String(userRow.id) },
-      allow_promotion_codes: true,
-      line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
-      success_url: `${FRONTEND_URL}/login.html?paid=1`,
-      cancel_url: `${FRONTEND_URL}/signup.html?canceled=1`,
+      customer_email: normEmail,
+      line_items: [{ price: PRICE_ID, quantity: 1 }],
+      client_reference_id: userIdForSession ? String(userIdForSession) : undefined,
+      metadata: userIdForSession ? { userId: String(userIdForSession) } : undefined,
+      success_url: `${FRONTEND_URL}/success.html`,
+      cancel_url: `${FRONTEND_URL}/cancel.html`,
     });
-
     return res.json({ url: session.url });
   } catch (err) {
     console.error(
       'create-checkout-session error:',
       err?.type || 'no-type',
       err?.message || err?.raw?.message || '(no message)',
-      'price:', (STRIPE_PRICE_ID || '').slice(0, 10) + '…',
-      'key mode:', (STRIPE_SECRET_KEY || '').startsWith('sk_live_') ? 'LIVE' : 'TEST'
+      'price:', (process.env.STRIPE_PRICE_ID || '').slice(0, 10) + '…',
+      'key mode:', (process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live_') ? 'LIVE' : 'TEST'
     );
     return res.status(500).json({ error: 'Stripe session failed' });
   }
@@ -273,6 +259,7 @@ router.post('/password/forgot', async (req, res) => {
     // Always pretend success
     if (!user) return res.json({ ok: true });
 
+    // optional: ensure table exists separately (migration)
     const token = makeToken();
     const tokenHash = hashToken(token);
     const expires = new Date(Date.now() + 60 * 60 * 1000); // 60 minutes
@@ -303,6 +290,7 @@ router.post('/password/reset', async (req, res) => {
   const token = (req.body.token || '').trim();
   const password = req.body.password || '';
 
+  // ✅ apply strong-password rule here as well
   if (!token || !PASSWORD_RE.test(password)) {
     return res.status(400).json({
       error:
@@ -334,9 +322,7 @@ router.post('/password/reset', async (req, res) => {
   }
 });
 
-/**
- * POST /api/auth/change-password (must be signed in)
- */
+// Change password (must be signed in)
 router.post('/change-password', authenticate, async (req, res) => {
   try {
     const { currentPassword = '', newPassword = '' } = req.body;
@@ -344,6 +330,7 @@ router.post('/change-password', authenticate, async (req, res) => {
     if (!currentPassword || !newPassword) {
       return res.status(400).json({ error: 'Current and new password are required' });
     }
+    // ✅ enforce strong-password rule
     if (!PASSWORD_RE.test(newPassword)) {
       return res.status(400).json({
         error:
