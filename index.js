@@ -107,7 +107,7 @@ app.use('/api/notify', resolvedNotify);
 
 
 /* ✅ Notification routes (admin email notifications, tests, etc.) */
-const notifyMod = require('./routes/notify');
+
 app.use('/api/notify', notifyMod.router || notifyMod.default || notifyMod);
 
 /* protected (require auth; most also require active subscription) */
