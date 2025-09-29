@@ -28,6 +28,39 @@ const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 const FROM_EMAIL = process.env.FROM_EMAIL || 'no-reply@example.com';
 
+// ------------ NEW: support signup notification ------------
+const SUPPORT_NOTIFY_TO =
+  process.env.SUPPORT_NOTIFY_TO || 'support@printshopinvoice.com';
+
+async function notifySupportSignup({ userId, email }) {
+  const subject = `🆕 New signup: ${email}`;
+  const html = `
+    <h2>New user signed up</h2>
+    <p><strong>Email:</strong> ${email}</p>
+    <p><strong>User ID:</strong> ${userId}</p>
+    <p><strong>Time (UTC):</strong> ${new Date().toISOString()}</p>
+  `;
+  const text =
+    `New user signed up\n` +
+    `Email: ${email}\n` +
+    `User ID: ${userId}\n` +
+    `Time: ${new Date().toISOString()}\n`;
+
+  if (resend) {
+    await resend.emails.send({
+      from: FROM_EMAIL,
+      to: SUPPORT_NOTIFY_TO,
+      subject,
+      html,
+      text,
+    });
+  } else {
+    // If email isn't configured, don't block signup—just log.
+    console.log('[notifySupportSignup]', { to: SUPPORT_NOTIFY_TO, subject, email, userId });
+  }
+}
+// ---------------------------------------------------------
+
 // ---- helpers for password reset ----
 function makeToken() {
   return crypto.randomBytes(32).toString('hex'); // plaintext token (emailed)
@@ -91,6 +124,11 @@ router.post('/register', async (req, res) => {
     try {
       await copyDefaultVariationsToUser(userId);
     } catch (_) {}
+
+    // 🔔 fire-and-forget support email (does NOT block response)
+    notifySupportSignup({ userId, email }).catch(e =>
+      console.warn('notifySupportSignup failed:', e.message)
+    );
 
     const token = jwt.sign({ id: userId, email }, JWT_SECRET, { expiresIn: '7d' });
     return res.status(201).json({ message: 'Registered successfully', userId, token });
