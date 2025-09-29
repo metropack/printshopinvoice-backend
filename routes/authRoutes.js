@@ -4,8 +4,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const Stripe = require('stripe');
 const crypto = require('crypto');
-const { Resend } = require('resend');
-const nodemailer = require('nodemailer'); // <-- ADDED
+const nodemailer = require('nodemailer');
 
 const router = express.Router();
 
@@ -18,27 +17,26 @@ const { copyDefaultVariationsToUser } = require('../middleware/utils/seedUtils')
 // auth middleware (for /me)
 const authenticate = require('../middleware/authenticate');
 
-// env
+// ====== ENV ======
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
-// ------------------- EMAIL CONFIG -------------------
-// Resend (if configured)
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
-// Use FROM_EMAIL if provided; otherwise allow EMAIL_FROM as a fallback
-const FROM_EMAIL =
-  process.env.FROM_EMAIL ||
-  process.env.EMAIL_FROM ||
-  'no-reply@printshopinvoice.com';
+// --- Mail settings (SMTP via Hostinger or similar) ---
+const MAIL_FROM =
+  process.env.EMAIL_FROM || '"Print Shop Invoice App" <no-reply@printshopinvoice.com>'; // what recipients see
+const MAIL_SENDER =
+  process.env.FROM_EMAIL || process.env.SMTP_USER || 'support@printshopinvoice.com'; // must be an owned mailbox (envelope/sender)
+const SUPPORT_NOTIFY_TO =
+  process.env.SUPPORT_NOTIFY_TO || process.env.ADMIN_EMAIL || 'support@printshopinvoice.com';
 
-// Hostinger / SMTP fallback (if configured)
-let smtpTransporter = null;
+// Optional SMTP transporter
+let transporter = null;
 if (process.env.SMTP_HOST) {
-  smtpTransporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,                      // e.g. smtp.hostinger.com
+  transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure:
       String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' ||
@@ -49,54 +47,43 @@ if (process.env.SMTP_HOST) {
   });
 }
 
-// Unified mail sender: prefer Resend, else SMTP, else noop
-async function sendMailUnified({ to, subject, html, text }) {
-  if (resend) {
-    return resend.emails.send({ from: FROM_EMAIL, to, subject, html, text });
+// Helper: send an email using transporter (logs if SMTP not set)
+async function sendMail({ to, subject, text, html }) {
+  if (!transporter) {
+    console.log('📭 SMTP not configured. Would have sent:', { to, subject });
+    return;
   }
-  if (smtpTransporter) {
-    const sender = process.env.SMTP_SENDER || process.env.SMTP_USER || FROM_EMAIL;
-    return smtpTransporter.sendMail({
-      from: FROM_EMAIL,                // visible From
-      sender,                          // satisfies some SMTP policies
-      envelope: { from: sender, to },  // actual MAIL FROM / RCPT TO
-      to,
-      subject,
-      html,
-      text,
-    });
-  }
-  // No mail configured → don't fail app logic
-  console.log('[mail noop] to:', to, 'subject:', subject);
-  return null;
+  await transporter.sendMail({
+    from: MAIL_FROM,
+    sender: MAIL_SENDER, // satisfies SMTP "owned by user" checks
+    envelope: { from: MAIL_SENDER, to },
+    to,
+    subject,
+    text,
+    html,
+  });
 }
 
-// ------------ support signup notification ------------
-const SUPPORT_NOTIFY_TO =
-  process.env.SUPPORT_NOTIFY_TO ||
-  process.env.ADMIN_EMAIL || // allow ADMIN_EMAIL from your env screen
-  'support@printshopinvoice.com';
-
+// ------------ Signup notification ------------
 async function notifySupportSignup({ userId, email }) {
   const subject = `🆕 New signup: ${email}`;
+  const text =
+    `New user signed up\n` +
+    `Email: ${email}\n` +
+    `User ID: ${userId}\n` +
+    `Time (UTC): ${new Date().toISOString()}\n`;
   const html = `
     <h2>New user signed up</h2>
     <p><strong>Email:</strong> ${email}</p>
     <p><strong>User ID:</strong> ${userId}</p>
     <p><strong>Time (UTC):</strong> ${new Date().toISOString()}</p>
   `;
-  const text =
-    `New user signed up\n` +
-    `Email: ${email}\n` +
-    `User ID: ${userId}\n` +
-    `Time: ${new Date().toISOString()}\n`;
   try {
-    await sendMailUnified({ to: SUPPORT_NOTIFY_TO, subject, html, text });
+    await sendMail({ to: SUPPORT_NOTIFY_TO, subject, text, html });
   } catch (e) {
-    console.warn('notifySupportSignup failed:', e.message);
+    console.warn('notifySupportSignup failed:', e?.message || e);
   }
 }
-// -----------------------------------------------------
 
 // ---- helpers for password reset ----
 function makeToken() {
@@ -107,20 +94,17 @@ function hashToken(t) {
 }
 async function sendResetEmail(to, link) {
   const subject = 'Reset your MPS Invoice App password';
+  const text =
+    'We received a request to reset your password.\n' +
+    `Open this link to reset: ${link}\n` +
+    'If you didn’t request this, you can ignore this email. This link expires in 60 minutes.';
   const html = `
     <p>We received a request to reset your password.</p>
     <p><a href="${link}">Click here to reset your password</a></p>
     <p>If you didn’t request this, you can ignore this email.</p>
     <p>This link expires in 60 minutes.</p>
   `;
-  const text =
-    `We received a request to reset your password.\n` +
-    `Reset link: ${link}\n` +
-    `If you didn’t request this, you can ignore this email.\n` +
-    `This link expires in 60 minutes.\n`;
-
-  // Use the same unified sender for reset emails
-  await sendMailUnified({ to, subject, html, text });
+  await sendMail({ to, subject, text, html });
 }
 
 // 🔐 Password policy: ≥8 chars, at least 1 letter, 1 number, 1 special char
@@ -166,9 +150,7 @@ router.post('/register', async (req, res) => {
     } catch (_) {}
 
     // 🔔 fire-and-forget support email (does NOT block response)
-    notifySupportSignup({ userId, email }).catch(e =>
-      console.warn('notifySupportSignup failed:', e.message)
-    );
+    notifySupportSignup({ userId, email });
 
     const token = jwt.sign({ id: userId, email }, JWT_SECRET, { expiresIn: '7d' });
     return res.status(201).json({ message: 'Registered successfully', userId, token });
@@ -257,7 +239,7 @@ router.post('/create-checkout-session', async (req, res) => {
   }
 
   const PRICE_ID = process.env.STRIPE_PRICE_ID;
-  const FRONTEND_URL = process.env.FRONTEND_URL || 'https://mps-site-rouge.vercel.app';
+  const FRONTEND_URL_ENV = process.env.FRONTEND_URL || 'https://mps-site-rouge.vercel.app';
 
   if (!PRICE_ID) {
     console.error('Missing STRIPE_PRICE_ID env var');
@@ -285,8 +267,8 @@ router.post('/create-checkout-session', async (req, res) => {
       line_items: [{ price: PRICE_ID, quantity: 1 }],
       client_reference_id: userIdForSession ? String(userIdForSession) : undefined,
       metadata: userIdForSession ? { userId: String(userIdForSession) } : undefined,
-      success_url: `${FRONTEND_URL}/success.html`,
-      cancel_url: `${FRONTEND_URL}/cancel.html`,
+      success_url: `${FRONTEND_URL_ENV}/success.html`,
+      cancel_url: `${FRONTEND_URL_ENV}/cancel.html`,
     });
     return res.json({ url: session.url });
   } catch (err) {
@@ -294,8 +276,10 @@ router.post('/create-checkout-session', async (req, res) => {
       'create-checkout-session error:',
       err?.type || 'no-type',
       err?.message || err?.raw?.message || '(no message)',
-      'price:', (process.env.STRIPE_PRICE_ID || '').slice(0, 10) + '…',
-      'key mode:', (process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live_') ? 'LIVE' : 'TEST'
+      'price:',
+      (process.env.STRIPE_PRICE_ID || '').slice(0, 10) + '…',
+      'key mode:',
+      (process.env.STRIPE_SECRET_KEY || '').startsWith('sk_live_') ? 'LIVE' : 'TEST'
     );
     return res.status(500).json({ error: 'Stripe session failed' });
   }
@@ -315,7 +299,7 @@ router.get('/diag/stripe', async (_req, res) => {
         type: price.type,
         recurring: price.recurring,
         livemode: price.livemode,
-      }
+      },
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
@@ -337,7 +321,6 @@ router.post('/password/forgot', async (req, res) => {
     // Always pretend success
     if (!user) return res.json({ ok: true });
 
-    // optional: ensure table exists separately (migration)
     const token = makeToken();
     const tokenHash = hashToken(token);
     const expires = new Date(Date.now() + 60 * 60 * 1000); // 60 minutes
@@ -418,10 +401,9 @@ router.post('/change-password', authenticate, async (req, res) => {
       });
     }
 
-    const { rows } = await pool.query(
-      'SELECT password_hash FROM users WHERE id = $1',
-      [req.user.id]
-    );
+    const { rows } = await pool.query('SELECT password_hash FROM users WHERE id = $1', [
+      req.user.id,
+    ]);
     const user = rows[0];
     if (!user) return res.status(404).json({ error: 'User not found' });
 
