@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const Stripe = require('stripe');
 const crypto = require('crypto');
 const { Resend } = require('resend');
+const nodemailer = require('nodemailer'); // <-- ADDED
 
 const router = express.Router();
 
@@ -24,13 +25,57 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
-// email (password reset)
+// ------------------- EMAIL CONFIG -------------------
+// Resend (if configured)
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
-const FROM_EMAIL = process.env.FROM_EMAIL || 'no-reply@example.com';
+// Use FROM_EMAIL if provided; otherwise allow EMAIL_FROM as a fallback
+const FROM_EMAIL =
+  process.env.FROM_EMAIL ||
+  process.env.EMAIL_FROM ||
+  'no-reply@printshopinvoice.com';
 
-// ------------ NEW: support signup notification ------------
+// Hostinger / SMTP fallback (if configured)
+let smtpTransporter = null;
+if (process.env.SMTP_HOST) {
+  smtpTransporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,                      // e.g. smtp.hostinger.com
+    port: Number(process.env.SMTP_PORT || 587),
+    secure:
+      String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' ||
+      Number(process.env.SMTP_PORT) === 465,
+    auth: process.env.SMTP_USER
+      ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+      : undefined,
+  });
+}
+
+// Unified mail sender: prefer Resend, else SMTP, else noop
+async function sendMailUnified({ to, subject, html, text }) {
+  if (resend) {
+    return resend.emails.send({ from: FROM_EMAIL, to, subject, html, text });
+  }
+  if (smtpTransporter) {
+    const sender = process.env.SMTP_SENDER || process.env.SMTP_USER || FROM_EMAIL;
+    return smtpTransporter.sendMail({
+      from: FROM_EMAIL,                // visible From
+      sender,                          // satisfies some SMTP policies
+      envelope: { from: sender, to },  // actual MAIL FROM / RCPT TO
+      to,
+      subject,
+      html,
+      text,
+    });
+  }
+  // No mail configured → don't fail app logic
+  console.log('[mail noop] to:', to, 'subject:', subject);
+  return null;
+}
+
+// ------------ support signup notification ------------
 const SUPPORT_NOTIFY_TO =
-  process.env.SUPPORT_NOTIFY_TO || 'support@printshopinvoice.com';
+  process.env.SUPPORT_NOTIFY_TO ||
+  process.env.ADMIN_EMAIL || // allow ADMIN_EMAIL from your env screen
+  'support@printshopinvoice.com';
 
 async function notifySupportSignup({ userId, email }) {
   const subject = `🆕 New signup: ${email}`;
@@ -45,21 +90,13 @@ async function notifySupportSignup({ userId, email }) {
     `Email: ${email}\n` +
     `User ID: ${userId}\n` +
     `Time: ${new Date().toISOString()}\n`;
-
-  if (resend) {
-    await resend.emails.send({
-      from: FROM_EMAIL,
-      to: SUPPORT_NOTIFY_TO,
-      subject,
-      html,
-      text,
-    });
-  } else {
-    // If email isn't configured, don't block signup—just log.
-    console.log('[notifySupportSignup]', { to: SUPPORT_NOTIFY_TO, subject, email, userId });
+  try {
+    await sendMailUnified({ to: SUPPORT_NOTIFY_TO, subject, html, text });
+  } catch (e) {
+    console.warn('notifySupportSignup failed:', e.message);
   }
 }
-// ---------------------------------------------------------
+// -----------------------------------------------------
 
 // ---- helpers for password reset ----
 function makeToken() {
@@ -69,18 +106,21 @@ function hashToken(t) {
   return crypto.createHash('sha256').update(t).digest('hex'); // stored hash
 }
 async function sendResetEmail(to, link) {
-  if (!resend) throw new Error('Email not configured');
-  await resend.emails.send({
-    from: FROM_EMAIL,
-    to,
-    subject: 'Reset your MPS Invoice App password',
-    html: `
-      <p>We received a request to reset your password.</p>
-      <p><a href="${link}">Click here to reset your password</a></p>
-      <p>If you didn’t request this, you can ignore this email.</p>
-      <p>This link expires in 60 minutes.</p>
-    `,
-  });
+  const subject = 'Reset your MPS Invoice App password';
+  const html = `
+    <p>We received a request to reset your password.</p>
+    <p><a href="${link}">Click here to reset your password</a></p>
+    <p>If you didn’t request this, you can ignore this email.</p>
+    <p>This link expires in 60 minutes.</p>
+  `;
+  const text =
+    `We received a request to reset your password.\n` +
+    `Reset link: ${link}\n` +
+    `If you didn’t request this, you can ignore this email.\n` +
+    `This link expires in 60 minutes.\n`;
+
+  // Use the same unified sender for reset emails
+  await sendMailUnified({ to, subject, html, text });
 }
 
 // 🔐 Password policy: ≥8 chars, at least 1 letter, 1 number, 1 special char
@@ -310,7 +350,9 @@ router.post('/password/forgot', async (req, res) => {
     );
 
     const link = `${FRONTEND_URL}/reset.html?token=${encodeURIComponent(token)}`;
-    try { await sendResetEmail(email, link); } catch (e) {
+    try {
+      await sendResetEmail(email, link);
+    } catch (e) {
       console.warn('sendResetEmail failed:', e.message);
     }
 
