@@ -87,7 +87,8 @@ app.use('/api/auth', passwordReset);
 app.use('/api/auth', authRoutes);
 
 /* ✅ Notification routes (admin email notifications, tests, etc.) */
-app.use('/api/notify', require('./routes/notify'));
+const notifyMod = require('./routes/notify');
+app.use('/api/notify', notifyMod.router || notifyMod.default || notifyMod);
 
 /* protected (require auth; most also require active subscription) */
 app.use('/api/profile',  authenticate, profileRoutes);
