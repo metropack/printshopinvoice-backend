@@ -11,6 +11,11 @@ const p = require('path');
 const app = express();
 app.set('trust proxy', 1);
 
+/* ───────────────────────── Router resolver ─────────────────────────
+   Makes app.use(...) safe if a route module exports {router}, or default, or the router itself.
+--------------------------------------------------------------------- */
+const resolveRouter = (mod) => (mod && (mod.router || mod.default)) || mod;
+
 /* ───────────────────────── CORS (relaxed for now) ───────────────────────── */
 const allowed = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -47,7 +52,8 @@ app.get('/__up',      (_req, res) => res.json({ ok: true, at: '/__up',      t: D
 /* ───────────────────────── Stripe webhook (raw body) ─────────────────────────
    IMPORTANT: mount this precisely so it cannot catch all of /api/*
 --------------------------------------------------------------------------- */
-const stripeWebhook = require('./routes/stripeWebhook');
+const stripeWebhookMod = require('./routes/stripeWebhook');
+const stripeWebhook = resolveRouter(stripeWebhookMod);
 app.use('/api/webhook', stripeWebhook);
 
 /* ───────────────────────── Body parsers & access log ───────────────────────── */
@@ -56,86 +62,69 @@ app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 // app.use(morgan('tiny'));
 
 // Debug/diagnostic routes (no auth). Keep while debugging, remove later.
-app.use('/api/_debug', require('./routes/diag'));
-app.use('/api/_debug', require('./routes/debugEmail'));
+const diagMod = require('./routes/diag');
+app.use('/api/_debug', resolveRouter(diagMod));
+const debugEmailMod = require('./routes/debugEmail');
+app.use('/api/_debug', resolveRouter(debugEmailMod));
 
 /* ───────────────────────── Static ───────────────────────── */
 app.use('/invoices', express.static(p.join(__dirname, 'invoices')));
 app.use('/uploads',  express.static(p.join(__dirname, 'uploads')));
-const supportRoutes = require('./routes/support');
-app.use('/api', supportRoutes);  // <-- gives you /api/support
+const supportRoutesMod = require('./routes/support');
+app.use('/api', resolveRouter(supportRoutesMod));  // <-- gives you /api/support
 
 /* ───────────────────────── Routes ───────────────────────── */
-const authRoutes        = require('./routes/authRoutes');
-const passwordReset     = require('./routes/passwordReset');
+const authRoutesMod        = require('./routes/authRoutes');
+const passwordResetMod     = require('./routes/passwordReset');
 
-const estimatesRoutes   = require('./routes/estimates');
-const invoicesRoutes    = require('./routes/invoices');
-const customersRoutes   = require('./routes/customers');
-const productsRoutes    = require('./routes/products');
-const reportsRoutes     = require('./routes/reports');
-const customTabsRoutes  = require('./routes/customTabs');
-const storeInfoRoutes   = require('./routes/storeInfoRoutes');
-const profileRoutes     = require('./routes/profile');
-const billingRoutes     = require('./routes/billing');
+const estimatesRoutesMod   = require('./routes/estimates');
+const invoicesRoutesMod    = require('./routes/invoices');
+const customersRoutesMod   = require('./routes/customers');
+const productsRoutesMod    = require('./routes/products');
+const reportsRoutesMod     = require('./routes/reports');
+const customTabsRoutesMod  = require('./routes/customTabs');
+const storeInfoRoutesMod   = require('./routes/storeInfoRoutes');
+const profileRoutesMod     = require('./routes/profile');
+const billingRoutesMod     = require('./routes/billing');
 
 const authenticate      = require('./middleware/authenticate');
 const subscriptionGuard = require('./middleware/subscriptionGuard');
 
 /* public */
-app.use('/api/auth', passwordReset);
-app.use('/api/auth', authRoutes);
-
-// === begin notify import debug ===
-const notifyMod = require('./routes/notify');
-const resolvedNotify = notifyMod?.router || notifyMod?.default || notifyMod;
-console.log('[notify] typeof notifyMod =', typeof notifyMod, 'keys=', Object.keys(notifyMod || {}));
-console.log('[notify] typeof resolved =', typeof resolvedNotify);
-
-if (typeof resolvedNotify !== 'function') {
-  throw new Error(
-    'routes/notify did not export an express router. ' +
-    JSON.stringify({
-      typeofNotifyMod: typeof notifyMod,
-      keys: Object.keys(notifyMod || {}),
-    })
-  );
-}
-
-app.use('/api/notify', resolvedNotify);
-// === end notify import debug ===
-
+app.use('/api/auth', resolveRouter(passwordResetMod));
+app.use('/api/auth', resolveRouter(authRoutesMod));
 
 /* ✅ Notification routes (admin email notifications, tests, etc.) */
-
-app.use('/api/notify', notifyMod.router || notifyMod.default || notifyMod);
+const notifyMod = require('./routes/notify');
+app.use('/api/notify', resolveRouter(notifyMod));
 
 /* protected (require auth; most also require active subscription) */
-app.use('/api/profile',  authenticate, profileRoutes);
-app.use('/api/billing',  authenticate, billingRoutes);
+app.use('/api/profile',  authenticate, resolveRouter(profileRoutesMod));
+app.use('/api/billing',  authenticate, resolveRouter(billingRoutesMod));
 
 // ── TEMPORARY TOGGLE: allow bypassing subscriptionGuard for targeted routes ──
 // Set BYPASS_SUB_GUARD=1 in env to mount these routes without the guard.
 // Everything else remains unchanged.
 const useGuard = process.env.BYPASS_SUB_GUARD !== '1';
 if (useGuard) {
-  app.use('/api/products',    authenticate, subscriptionGuard, productsRoutes);
-  app.use('/api/invoices',    authenticate, subscriptionGuard, invoicesRoutes);
+  app.use('/api/products',    authenticate, subscriptionGuard, resolveRouter(productsRoutesMod));
+  app.use('/api/invoices',    authenticate, subscriptionGuard, resolveRouter(invoicesRoutesMod));
 } else {
   console.warn('[boot] BYPASS_SUB_GUARD=1 → mounting /api/products & /api/invoices WITHOUT subscriptionGuard');
-  app.use('/api/products',    authenticate, productsRoutes);
-  app.use('/api/invoices',    authenticate, invoicesRoutes);
+  app.use('/api/products',    authenticate, resolveRouter(productsRoutesMod));
+  app.use('/api/invoices',    authenticate, resolveRouter(invoicesRoutesMod));
 }
 
 // All the rest keep the guard as before
-app.use('/api/estimates',   authenticate, subscriptionGuard, estimatesRoutes);
-app.use('/api/customers',   authenticate, subscriptionGuard, customersRoutes);
-app.use('/api/reports',     authenticate, subscriptionGuard, reportsRoutes);
-app.use('/api/custom_tabs', authenticate, subscriptionGuard, customTabsRoutes);
-app.use('/api/store-info',  authenticate, subscriptionGuard, storeInfoRoutes);
+app.use('/api/estimates',   authenticate, subscriptionGuard, resolveRouter(estimatesRoutesMod));
+app.use('/api/customers',   authenticate, subscriptionGuard, resolveRouter(customersRoutesMod));
+app.use('/api/reports',     authenticate, subscriptionGuard, resolveRouter(reportsRoutesMod));
+app.use('/api/custom_tabs', authenticate, subscriptionGuard, resolveRouter(customTabsRoutesMod));
+app.use('/api/store-info',  authenticate, subscriptionGuard, resolveRouter(storeInfoRoutesMod));
 
 /* ✅ Downloads (presigned S3) — mount BEFORE 404 */
-app.use('/api', require('./routes/downloads'));
+const downloadsMod = require('./routes/downloads');
+app.use('/api', resolveRouter(downloadsMod));
 
 /* root */
 app.get('/', (_req, res) => res.send('Backend is working!'));
