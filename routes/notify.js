@@ -1,19 +1,10 @@
+// backend/routes/notify.js
 const express = require('express');
 const nodemailer = require('nodemailer');
 
 const router = express.Router();
 
-/* ── SMTP from env ──
-  Expected on Render:
-  SMTP_HOST=smtp.hostinger.com
-  SMTP_PORT=587
-  SMTP_SECURE=false
-  SMTP_USER=support@printshopinvoice.com
-  SMTP_PASS=********
-  EMAIL_FROM="Print Shop Invoice App" <support@printshopinvoice.com>
-  FROM_EMAIL=support@printshopinvoice.com
-  SUPPORT_NOTIFY_TO=support@printshopinvoice.com
-*/
+/* SMTP env (strings) */
 const MAIL_FROM =
   process.env.EMAIL_FROM || '"Print Shop Invoice App" <support@printshopinvoice.com>';
 const MAIL_SENDER =
@@ -56,14 +47,14 @@ async function sendMail({ to, subject, text, html }) {
   });
 }
 
-/* Simple GET to test SMTP end-to-end */
+/* GET /api/notify/test */
 router.get('/test', async (_req, res) => {
   try {
     await sendMail({
       to: SUPPORT_NOTIFY_TO,
       subject: 'SMTP test (/api/notify/test)',
-      text: 'This is a test from /api/notify/test',
-      html: '<p>This is a <strong>test</strong> from /api/notify/test</p>',
+      text: 'Test email from /api/notify/test',
+      html: '<p>Test email from <strong>/api/notify/test</strong></p>',
     });
     res.json({ ok: true, to: SUPPORT_NOTIFY_TO });
   } catch (e) {

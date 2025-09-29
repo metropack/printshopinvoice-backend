@@ -86,6 +86,26 @@ const subscriptionGuard = require('./middleware/subscriptionGuard');
 app.use('/api/auth', passwordReset);
 app.use('/api/auth', authRoutes);
 
+// === begin notify import debug ===
+const notifyMod = require('./routes/notify');
+const resolvedNotify = notifyMod?.router || notifyMod?.default || notifyMod;
+console.log('[notify] typeof notifyMod =', typeof notifyMod, 'keys=', Object.keys(notifyMod || {}));
+console.log('[notify] typeof resolved =', typeof resolvedNotify);
+
+if (typeof resolvedNotify !== 'function') {
+  throw new Error(
+    'routes/notify did not export an express router. ' +
+    JSON.stringify({
+      typeofNotifyMod: typeof notifyMod,
+      keys: Object.keys(notifyMod || {}),
+    })
+  );
+}
+
+app.use('/api/notify', resolvedNotify);
+// === end notify import debug ===
+
+
 /* ✅ Notification routes (admin email notifications, tests, etc.) */
 const notifyMod = require('./routes/notify');
 app.use('/api/notify', notifyMod.router || notifyMod.default || notifyMod);
