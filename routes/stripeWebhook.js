@@ -1,15 +1,104 @@
 // backend/routes/stripeWebhook.js
 const express = require('express');
 const Stripe = require('stripe');
+const nodemailer = require('nodemailer');
 const pool = require('../db');
 
 const router = express.Router();
+
+/* ───────────────────────── Stripe ───────────────────────── */
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-// ❗ Use raw body ONLY on this route (do not apply express.json() here)
+// Raw body ONLY for this route
 const rawBody = express.raw({ type: 'application/json' });
 
+/* ───────────────────────── Mail (Hostinger SMTP) ───────────────────────── */
+const MAIL_FROM =
+  process.env.EMAIL_FROM || '"Print Shop Invoice App" <support@printshopinvoice.com>'; // what recipients see
+const MAIL_SENDER =
+  process.env.FROM_EMAIL || process.env.SMTP_USER || 'support@printshopinvoice.com'; // envelope sender
+const SUPPORT_NOTIFY_TO =
+  process.env.SUPPORT_NOTIFY_TO || process.env.ADMIN_EMAIL || 'support@printshopinvoice.com';
+
+let transporter = null;
+if (process.env.SMTP_HOST) {
+  transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure:
+      String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' ||
+      Number(process.env.SMTP_PORT) === 465,
+    auth: process.env.SMTP_USER
+      ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+      : undefined,
+  });
+
+  // Non-fatal verification log
+  transporter.verify().then(
+    () => console.log('✉️  SMTP (webhook) ready'),
+    (e) => console.warn('✉️  SMTP (webhook) verify failed:', e?.message || e)
+  );
+}
+
+async function sendMail({ to, subject, text, html }) {
+  if (!transporter) {
+    console.log('📭 SMTP not configured. Would have sent:', { to, subject });
+    return;
+  }
+  await transporter.sendMail({
+    from: MAIL_FROM,
+    sender: MAIL_SENDER,
+    envelope: { from: MAIL_SENDER, to },
+    to,
+    subject,
+    text,
+    html,
+  });
+}
+
+async function notifySupport({ title, email, userId, status, priceId, extra }) {
+  const subject = `${title}: ${email || '(no email)'}${status ? ` (${status})` : ''}`;
+  const time = new Date().toISOString();
+  const text =
+    `${title}\n` +
+    (email ? `Email: ${email}\n` : '') +
+    (userId ? `User ID: ${userId}\n` : '') +
+    (status ? `Status: ${status}\n` : '') +
+    (priceId ? `Price ID: ${priceId}\n` : '') +
+    `Time (UTC): ${time}\n` +
+    (extra ? `Extra: ${extra}\n` : '');
+  const html = `
+    <h2>${title}</h2>
+    ${email ? `<p><strong>Email:</strong> ${email}</p>` : ''}
+    ${userId ? `<p><strong>User ID:</strong> ${userId}</p>` : ''}
+    ${status ? `<p><strong>Status:</strong> ${status}</p>` : ''}
+    ${priceId ? `<p><strong>Price ID:</strong> ${priceId}</p>` : ''}
+    <p><strong>Time (UTC):</strong> ${time}</p>
+    ${extra ? `<pre>${String(extra)}</pre>` : ''}
+  `;
+  try {
+    await sendMail({ to: SUPPORT_NOTIFY_TO, subject, text, html });
+  } catch (e) {
+    console.warn('notifySupport failed:', e?.message || e);
+  }
+}
+
+/* ───────────────────────── DB helpers ───────────────────────── */
+async function findUserById(id) {
+  const r = await pool.query('SELECT id, email FROM users WHERE id=$1', [id]);
+  return r.rows[0] || null;
+}
+async function findUserByEmail(email) {
+  const r = await pool.query('SELECT id, email FROM users WHERE lower(email)=lower($1)', [email]);
+  return r.rows[0] || null;
+}
+async function findUserByCustomerId(cusId) {
+  const r = await pool.query('SELECT id, email FROM users WHERE stripe_customer_id=$1', [cusId]);
+  return r.rows[0] || null;
+}
+
+/* ───────────────────────── Webhook route ───────────────────────── */
 router.post('/stripe/webhook', rawBody, async (req, res) => {
   const sig = req.headers['stripe-signature'];
   let event;
@@ -25,26 +114,28 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
   try {
     switch (event.type) {
       /**
-       * Fires after a successful Checkout. We:
+       * After successful Checkout:
        * - set subscription_status = 'active'
        * - store stripe_customer_id (cus_...)
        * - store stripe_subscription_id (sub_...)
-       *
-       * We try (in order): userId (client_reference_id/metadata), customerId, email.
+       * - notify support
        */
       case 'checkout.session.completed': {
         const s = event.data.object;
 
-        const userIdRaw =
-          s.client_reference_id || (s.metadata && s.metadata.userId);
+        const userIdRaw = s.client_reference_id || (s.metadata && s.metadata.userId);
         const userId =
           userIdRaw && /^\d+$/.test(String(userIdRaw)) ? Number(userIdRaw) : null;
 
-        const customerId = s.customer || null;        // cus_...
+        const customerId = s.customer || null;         // cus_...
         const subscriptionId = s.subscription || null; // sub_...
-        const email =
-          s.customer_details?.email || s.customer_email || null;
+        const email = (s.customer_details?.email || s.customer_email || '').toLowerCase();
+        const priceId =
+          (s.line_items && s.line_items[0] && s.line_items[0].price && s.line_items[0].price.id) ||
+          (s.metadata && s.metadata.price) ||
+          null;
 
+        let rowUser = null;
         let updated = 0;
 
         if (userId) {
@@ -57,6 +148,7 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
             [userId, customerId, subscriptionId]
           );
           updated = r.rowCount;
+          rowUser = await findUserById(userId);
         }
 
         if (!updated && customerId) {
@@ -68,6 +160,7 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
             [customerId, subscriptionId]
           );
           updated = r2.rowCount;
+          if (!rowUser) rowUser = await findUserByCustomerId(customerId);
         }
 
         if (!updated && email) {
@@ -79,19 +172,42 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
               WHERE lower(email) = lower($1)`,
             [email, customerId, subscriptionId]
           );
+          if (!rowUser) rowUser = await findUserByEmail(email);
         }
+
+        await notifySupport({
+          title: '✅ Subscription checkout completed',
+          email: rowUser?.email || email,
+          userId: rowUser?.id,
+          status: 'active',
+          priceId,
+          extra: `customer=${customerId} subscription=${subscriptionId}`
+        });
+
         break;
       }
 
       /**
-       * Keep DB in sync when the subscription changes (past_due, canceled, etc).
-       * We collapse to two app states: active / inactive.
+       * Keep DB in sync when the subscription changes.
+       * Collapse to active/inactive for app logic and notify on important changes.
        */
-      case 'customer.subscription.updated': {
+      case 'customer.subscription.created': {
         const sub = event.data.object;
         const customerId = sub.customer;
-        const subscriptionId = sub.id;
-        const status = sub.status; // active | trialing | past_due | canceled | unpaid | incomplete...
+        const status = sub.status; // trialing | active | ...
+        const priceId = sub.items?.data?.[0]?.price?.id;
+
+        // Try to resolve user/email
+        let user = await findUserByCustomerId(customerId);
+        let email = user?.email;
+
+        if (!email) {
+          try {
+            const customer = await stripe.customers.retrieve(customerId);
+            email = (customer.email || '').toLowerCase();
+            if (!user && email) user = await findUserByEmail(email);
+          } catch (_) {}
+        }
 
         const newStatus =
           status === 'active' || status === 'trialing' ? 'active' : 'inactive';
@@ -101,18 +217,53 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
               SET subscription_status    = $2,
                   stripe_subscription_id = $3
             WHERE stripe_customer_id = $1`,
-          [customerId, newStatus, subscriptionId]
+          [customerId, newStatus, sub.id]
         );
+
+        await notifySupport({
+          title: '🆕 Subscription created',
+          email,
+          userId: user?.id,
+          status: newStatus,
+          priceId,
+          extra: `customer=${customerId} subscription=${sub.id}`
+        });
+
         break;
       }
 
-      /**
-       * Subscription ended → mark inactive and clear subscription id.
-       */
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        const customerId = sub.customer;
+        const status = sub.status;
+        const priceId = sub.items?.data?.[0]?.price?.id;
+
+        const newStatus =
+          status === 'active' || status === 'trialing' ? 'active' : 'inactive';
+
+        await pool.query(
+          `UPDATE users
+              SET subscription_status    = $2,
+                  stripe_subscription_id = $3
+            WHERE stripe_customer_id = $1`,
+          [customerId, newStatus, sub.id]
+        );
+
+        // Notify only on meaningful changes
+        await notifySupport({
+          title: '🔄 Subscription updated',
+          email: (await findUserByCustomerId(customerId))?.email,
+          status: newStatus,
+          priceId,
+          extra: `customer=${customerId} subscription=${sub.id}`
+        });
+
+        break;
+      }
+
       case 'customer.subscription.deleted': {
         const sub = event.data.object;
         const customerId = sub.customer;
-        const subscriptionId = sub.id;
 
         await pool.query(
           `UPDATE users
@@ -120,15 +271,20 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
                   stripe_subscription_id = NULL
             WHERE stripe_customer_id = $1
                OR stripe_subscription_id = $2`,
-          [customerId, subscriptionId]
+          [customerId, sub.id]
         );
+
+        await notifySupport({
+          title: '❌ Subscription canceled',
+          email: (await findUserByCustomerId(customerId))?.email,
+          status: 'inactive',
+          priceId: sub.items?.data?.[0]?.price?.id,
+          extra: `customer=${customerId} subscription=${sub.id}`
+        });
+
         break;
       }
 
-      /**
-       * Optional: mark inactive on failed payment, active on success.
-       * (These are conservative; your app logic might not need them.)
-       */
       case 'invoice.payment_failed': {
         const inv = event.data.object;
         const customerId = inv.customer;
@@ -137,6 +293,15 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
             WHERE stripe_customer_id=$1`,
           [customerId]
         );
+
+        await notifySupport({
+          title: '⚠️ Payment failed',
+          email: (await findUserByCustomerId(customerId))?.email,
+          status: 'inactive',
+          priceId: inv.lines?.data?.[0]?.price?.id,
+          extra: `invoice=${inv.id} customer=${customerId}`
+        });
+
         break;
       }
 
@@ -148,6 +313,15 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
             WHERE stripe_customer_id=$1`,
           [customerId]
         );
+
+        await notifySupport({
+          title: '💸 Payment succeeded',
+          email: (await findUserByCustomerId(customerId))?.email,
+          status: 'active',
+          priceId: inv.lines?.data?.[0]?.price?.id,
+          extra: `invoice=${inv.id} customer=${customerId}`
+        });
+
         break;
       }
 

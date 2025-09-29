@@ -22,13 +22,14 @@ const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 // --- Mail settings (SMTP via Hostinger or similar) ---
 const MAIL_FROM =
-  process.env.EMAIL_FROM || '"Print Shop Invoice App" <no-reply@printshopinvoice.com>'; // what recipients see
+  process.env.EMAIL_FROM || '"Print Shop Invoice App" <support@printshopinvoice.com>'; // what recipients see
 const MAIL_SENDER =
-  process.env.FROM_EMAIL || process.env.SMTP_USER || 'support@printshopinvoice.com'; // must be an owned mailbox (envelope/sender)
+  process.env.FROM_EMAIL || process.env.SMTP_USER || 'support@printshopinvoice.com'; // envelope/sender
 const SUPPORT_NOTIFY_TO =
   process.env.SUPPORT_NOTIFY_TO || process.env.ADMIN_EMAIL || 'support@printshopinvoice.com';
 
@@ -45,6 +46,12 @@ if (process.env.SMTP_HOST) {
       ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
       : undefined,
   });
+
+  // log verify result once at boot (non-fatal if it fails)
+  transporter.verify().then(
+    () => console.log('✉️  SMTP ready'),
+    (e) => console.warn('✉️  SMTP verify failed:', e?.message || e)
+  );
 }
 
 // Helper: send an email using transporter (logs if SMTP not set)
@@ -55,7 +62,7 @@ async function sendMail({ to, subject, text, html }) {
   }
   await transporter.sendMail({
     from: MAIL_FROM,
-    sender: MAIL_SENDER, // satisfies SMTP "owned by user" checks
+    sender: MAIL_SENDER, // satisfies SMTP "owned mailbox" rules
     envelope: { from: MAIL_SENDER, to },
     to,
     subject,
@@ -82,6 +89,31 @@ async function notifySupportSignup({ userId, email }) {
     await sendMail({ to: SUPPORT_NOTIFY_TO, subject, text, html });
   } catch (e) {
     console.warn('notifySupportSignup failed:', e?.message || e);
+  }
+}
+
+// ------------ Subscription notification ------------
+async function notifySupportSubscribed({ userId, email, status, priceId }) {
+  const subject = `✅ Subscription started: ${email} (${status})`;
+  const text =
+    `A user started a subscription\n` +
+    `Email: ${email}\n` +
+    `User ID: ${userId}\n` +
+    `Status: ${status}\n` +
+    `Price ID: ${priceId || '(n/a)'}\n` +
+    `Time (UTC): ${new Date().toISOString()}\n`;
+  const html = `
+    <h2>Subscription started</h2>
+    <p><strong>Email:</strong> ${email}</p>
+    <p><strong>User ID:</strong> ${userId}</p>
+    <p><strong>Status:</strong> ${status}</p>
+    <p><strong>Price ID:</strong> ${priceId || '(n/a)'}</p>
+    <p><strong>Time (UTC):</strong> ${new Date().toISOString()}</p>
+  `;
+  try {
+    await sendMail({ to: SUPPORT_NOTIFY_TO, subject, text, html });
+  } catch (e) {
+    console.warn('notifySupportSubscribed failed:', e?.message || e);
   }
 }
 
@@ -112,7 +144,6 @@ const PASSWORD_RE = /^(?=.*[A-Za-z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$/;
 
 /**
  * POST /api/auth/register
- * Create user, seed defaults, return token + userId
  */
 router.post('/register', async (req, res) => {
   const { email = '', password = '' } = req.body;
@@ -122,7 +153,6 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'Email and password required' });
     }
 
-    // ✅ Enforce strong password
     if (!PASSWORD_RE.test(password)) {
       return res.status(400).json({
         error:
@@ -144,12 +174,9 @@ router.post('/register', async (req, res) => {
     );
     const userId = result.rows[0].id;
 
-    // best-effort seed
-    try {
-      await copyDefaultVariationsToUser(userId);
-    } catch (_) {}
+    try { await copyDefaultVariationsToUser(userId); } catch (_) {}
 
-    // 🔔 fire-and-forget support email (does NOT block response)
+    // fire-and-forget support email
     notifySupportSignup({ userId, email });
 
     const token = jwt.sign({ id: userId, email }, JWT_SECRET, { expiresIn: '7d' });
@@ -162,7 +189,6 @@ router.post('/register', async (req, res) => {
 
 /**
  * POST /api/auth/login
- * Validate credentials, return token + user fields
  */
 router.post('/login', async (req, res) => {
   const email = (req.body.email || '').trim();
@@ -229,8 +255,6 @@ router.get('/license-check', async (req, res) => {
 
 /**
  * POST /api/auth/create-checkout-session
- * Creates a Stripe subscription checkout session
- * If a token is provided, we use userId as client_reference_id
  */
 router.post('/create-checkout-session', async (req, res) => {
   if (!stripe) {
@@ -308,7 +332,6 @@ router.get('/diag/stripe', async (_req, res) => {
 
 /**
  * POST /api/auth/password/forgot { email }
- * Always returns ok (to avoid email enumeration).
  */
 router.post('/password/forgot', async (req, res) => {
   const email = (req.body.email || '').trim().toLowerCase();
@@ -333,9 +356,7 @@ router.post('/password/forgot', async (req, res) => {
     );
 
     const link = `${FRONTEND_URL}/reset.html?token=${encodeURIComponent(token)}`;
-    try {
-      await sendResetEmail(email, link);
-    } catch (e) {
+    try { await sendResetEmail(email, link); } catch (e) {
       console.warn('sendResetEmail failed:', e.message);
     }
 
@@ -353,7 +374,6 @@ router.post('/password/reset', async (req, res) => {
   const token = (req.body.token || '').trim();
   const password = req.body.password || '';
 
-  // ✅ apply strong-password rule here as well
   if (!token || !PASSWORD_RE.test(password)) {
     return res.status(400).json({
       error:
@@ -393,7 +413,6 @@ router.post('/change-password', authenticate, async (req, res) => {
     if (!currentPassword || !newPassword) {
       return res.status(400).json({ error: 'Current and new password are required' });
     }
-    // ✅ enforce strong-password rule
     if (!PASSWORD_RE.test(newPassword)) {
       return res.status(400).json({
         error:
@@ -420,11 +439,102 @@ router.post('/change-password', authenticate, async (req, res) => {
   }
 });
 
-/**
- * GET /api/auth/test
- */
-router.get('/test', (_req, res) => {
-  res.json({ message: 'Auth route working' });
+// ---------- Diagnostics: test email ----------
+router.get('/test-mail', async (_req, res) => {
+  try {
+    await sendMail({
+      to: SUPPORT_NOTIFY_TO,
+      subject: 'SMTP test from Print Shop Invoice backend',
+      text: 'This is a test email from your Render service.',
+      html: '<p>This is a <strong>test email</strong> from your Render service.</p>',
+    });
+    res.json({ ok: true, to: SUPPORT_NOTIFY_TO });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
 });
 
-module.exports = router;
+/**
+ * Stripe webhook handler (exported)
+ * We handle:
+ *  - checkout.session.completed  → look up user, mark trialing/active, notify
+ *  - customer.subscription.created / updated → track status changes, notify on created
+ */
+async function stripeWebhook(req, res) {
+  if (!stripe) return res.status(500).send('Stripe not configured');
+
+  let event;
+  try {
+    const sig = req.headers['stripe-signature'];
+    event = STRIPE_WEBHOOK_SECRET
+      ? stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET)
+      : JSON.parse(req.body); // for local testing without signature
+  } catch (err) {
+    console.error('❌ Webhook signature verify failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const email = (session.customer_email || '').toLowerCase();
+      const priceId = session?.line_items?.[0]?.price?.id || session?.metadata?.price || null;
+
+      // userId from client_reference_id if you set it
+      const hintedUserId = session.client_reference_id ? Number(session.client_reference_id) : null;
+
+      let userRow = null;
+      if (hintedUserId) {
+        const { rows } = await pool.query('SELECT id, email FROM users WHERE id=$1', [hintedUserId]);
+        userRow = rows[0] || null;
+      } else if (email) {
+        const { rows } = await pool.query('SELECT id, email FROM users WHERE lower(email)=lower($1)', [email]);
+        userRow = rows[0] || null;
+      }
+
+      if (userRow) {
+        // mark trialing (Stripe default) or active
+        await pool.query(
+          'UPDATE users SET subscription_status=$1 WHERE id=$2',
+          [session.status === 'complete' ? 'trialing' : 'active', userRow.id]
+        );
+        await notifySupportSubscribed({
+          userId: userRow.id,
+          email: userRow.email || email,
+          status: 'trialing',
+          priceId: priceId || process.env.STRIPE_PRICE_ID
+        });
+      } else {
+        console.warn('Webhook: could not match user for session', session.id, email);
+      }
+    }
+
+    if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated') {
+      const sub = event.data.object;
+      const status = sub.status; // trialing, active, past_due, canceled, etc.
+      const priceId = sub.items?.data?.[0]?.price?.id;
+
+      // Find user by email via customer -> invoice settings if available (fallback none)
+      let email = sub.customer_email || sub.customer_details?.email;
+      // You can also store Stripe customer id in your DB and join here
+
+      if (email) {
+        const { rows } = await pool.query('SELECT id, email FROM users WHERE lower(email)=lower($1)', [email]);
+        const userRow = rows[0];
+        if (userRow) {
+          await pool.query('UPDATE users SET subscription_status=$1 WHERE id=$2', [status, userRow.id]);
+          if (event.type === 'customer.subscription.created') {
+            await notifySupportSubscribed({ userId: userRow.id, email, status, priceId });
+          }
+        }
+      }
+    }
+
+    res.json({ received: true });
+  } catch (e) {
+    console.error('Webhook handler error:', e);
+    res.status(500).send('Server error');
+  }
+}
+
+module.exports = { router, stripeWebhook };

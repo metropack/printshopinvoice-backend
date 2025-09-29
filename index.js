@@ -86,6 +86,9 @@ const subscriptionGuard = require('./middleware/subscriptionGuard');
 app.use('/api/auth', passwordReset);
 app.use('/api/auth', authRoutes);
 
+/* ✅ Notification routes (admin email notifications, tests, etc.) */
+app.use('/api/notify', require('./routes/notify'));
+
 /* protected (require auth; most also require active subscription) */
 app.use('/api/profile',  authenticate, profileRoutes);
 app.use('/api/billing',  authenticate, billingRoutes);
