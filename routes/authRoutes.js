@@ -289,6 +289,10 @@ router.post('/create-checkout-session', async (req, res) => {
       mode: 'subscription',
       customer_email: normEmail,
       line_items: [{ price: PRICE_ID, quantity: 1 }],
+
+       subscription_data: {
+        trial_period_days: 1,
+      },
       client_reference_id: userIdForSession ? String(userIdForSession) : undefined,
       metadata: userIdForSession ? { userId: String(userIdForSession) } : undefined,
       success_url: `${FRONTEND_URL_ENV}/success.html`,
