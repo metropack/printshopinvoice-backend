@@ -249,7 +249,6 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           [customerId, newStatus, sub.id]
         );
 
-        // Notify only on meaningful changes
         await notifySupport({
           title: '🔄 Subscription updated',
           email: (await findUserByCustomerId(customerId))?.email,
@@ -325,6 +324,54 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
         break;
       }
 
+      /* ────────────────── ADDED: Newer event for paid invoices ────────────────── */
+      case 'invoice_payment.paid': {
+        // New Stripe event (2025-05-28 API) when an invoice payment is successful
+        const inpay = event.data.object; // type "invoice_payment"
+        const invoiceId = inpay.invoice;
+        let customerId = (inpay.payment && inpay.payment.customer) || inpay.customer || null;
+
+        // Fallback: fetch invoice to get the customer id
+        if (!customerId && invoiceId) {
+          try {
+            const inv = await stripe.invoices.retrieve(invoiceId);
+            customerId = inv.customer || null;
+          } catch (_) {}
+        }
+
+        // Mark the user as active for that customer
+        if (customerId) {
+          await pool.query(
+            `UPDATE users SET subscription_status='active'
+              WHERE stripe_customer_id=$1`,
+            [customerId]
+          );
+        }
+
+        // Try to include a price id from the invoice
+        let priceId = null;
+        try {
+          if (invoiceId) {
+            const inv = await stripe.invoices.retrieve(invoiceId);
+            priceId = inv?.lines?.data?.[0]?.price?.id || null;
+          }
+        } catch (_) {}
+
+        const user = customerId ? await findUserByCustomerId(customerId) : null;
+
+        await notifySupport({
+          title: '💸 Invoice payment (invoice_payment.paid)',
+          email: user?.email,
+          userId: user?.id,
+          status: 'active',
+          priceId,
+          extra: `invoice=${invoiceId} customer=${customerId}`
+        });
+
+        break;
+      }
+      /* ───────────────────────────────────────────────────────────────────────── */
+
       default:
         // No-op for other events
         break;
@@ -337,4 +384,4 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
   }
 });
 
-module.exports = router;
+module.exports = r
