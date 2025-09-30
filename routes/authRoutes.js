@@ -14,7 +14,7 @@ const pool = require('../db');
 // optional seeding util
 const { copyDefaultVariationsToUser } = require('../middleware/utils/seedUtils');
 
-// auth middleware (for /me)
+// auth middleware (for /me and billing ops)
 const authenticate = require('../middleware/authenticate');
 
 // ====== ENV ======
@@ -289,8 +289,7 @@ router.post('/create-checkout-session', async (req, res) => {
       mode: 'subscription',
       customer_email: normEmail,
       line_items: [{ price: PRICE_ID, quantity: 1 }],
-
-       subscription_data: {
+      subscription_data: {
         trial_period_days: 1,
       },
       client_reference_id: userIdForSession ? String(userIdForSession) : undefined,
@@ -455,6 +454,67 @@ router.get('/test-mail', async (_req, res) => {
     res.json({ ok: true, to: SUPPORT_NOTIFY_TO });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+/**
+ * NEW: POST /api/billing/resume
+ * Clear, user-friendly messages for the Resume Subscription action.
+ * (Added to fix vague “Unable to resume subscription” alerts.)
+ */
+router.post('/billing/resume', authenticate, async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: 'Stripe is not configured.' });
+
+  try {
+    // We keep the query explicit so it works even if these columns are nullable.
+    const { rows } = await pool.query(
+      `SELECT id, email, subscription_status, stripe_subscription_id
+         FROM users
+        WHERE id = $1`,
+      [req.user.id]
+    );
+    const u = rows[0];
+    if (!u) return res.status(404).json({ error: 'User not found.' });
+
+    if (!u.stripe_subscription_id) {
+      return res.status(400).json({
+        error:
+          'No Stripe subscription on file to resume. Please start a new checkout from “Manage payment / billing”.',
+      });
+    }
+
+    // Check current state at Stripe
+    let sub = await stripe.subscriptions.retrieve(u.stripe_subscription_id);
+
+    // Fully canceled or expired subscriptions cannot be resumed
+    if (sub.status === 'canceled' || sub.status === 'incomplete_expired' || sub.canceled_at) {
+      return res.status(400).json({
+        error:
+          'This subscription is fully canceled and cannot be resumed. Start a new checkout from “Manage payment / billing”.',
+      });
+    }
+
+    // Already active and not set to cancel at period end – treat as success (idempotent)
+    if ((sub.status === 'active' || sub.status === 'trialing') && sub.cancel_at_period_end === false) {
+      await pool.query(`UPDATE users SET subscription_status='active' WHERE id=$1`, [u.id]);
+      return res.json({ ok: true, info: 'Subscription is already active.' });
+    }
+
+    // Resume by unsetting cancel_at_period_end
+    sub = await stripe.subscriptions.update(u.stripe_subscription_id, {
+      cancel_at_period_end: false,
+    });
+
+    const newStatus = (sub.status === 'active' || sub.status === 'trialing') ? 'active' : 'inactive';
+    await pool.query(`UPDATE users SET subscription_status=$2 WHERE id=$1`, [u.id, newStatus]);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    // Provide a clear, human message
+    const msg =
+      e?.message ||
+      'Could not resume subscription right now. Please try again or use “Manage payment / billing”.';
+    return res.status(400).json({ error: msg });
   }
 });
 
