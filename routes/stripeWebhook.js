@@ -57,6 +57,16 @@ async function sendMail({ to, subject, text, html }) {
   });
 }
 
+// ── ADDED: simple helper to email the customer using the same transporter ──
+async function sendCustomerMail(to, subject, text, html) {
+  if (!to) return;
+  try {
+    await sendMail({ to, subject, text, html });
+  } catch (e) {
+    console.warn('sendCustomerMail failed:', e?.message || e);
+  }
+}
+
 async function notifySupport({ title, email, userId, status, priceId, extra }) {
   const subject = `${title}: ${email || '(no email)'}${status ? ` (${status})` : ''}`;
   const time = new Date().toISOString();
@@ -184,6 +194,21 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `customer=${customerId} subscription=${subscriptionId}`
         });
 
+        // ADDED: Customer email — trial started / welcome
+        {
+          const toEmail = (rowUser?.email || email || '').toLowerCase();
+          await sendCustomerMail(
+            toEmail,
+            'Welcome — Your 1-day trial has started',
+            `Thanks for trying MPS Invoice App!
+You won’t be charged today. Your trial ends in 1 day and billing begins afterward at $29.99/month.
+Cancel anytime from your account settings.`,
+            `<p>Thanks for trying <strong>MPS Invoice App</strong>!</p>
+             <p>You won’t be charged today. Your trial runs for <strong>1 day</strong> and billing begins afterward at <strong>$29.99/month</strong>.</p>
+             <p>You can cancel anytime from your account settings.</p>`
+          );
+        }
+
         break;
       }
 
@@ -229,6 +254,19 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `customer=${customerId} subscription=${sub.id}`
         });
 
+        // ADDED: Customer email — created (trialing/active)
+        if (email) {
+          const humanStatus = status === 'trialing' ? 'trialing' : 'active';
+          await sendCustomerMail(
+            email.toLowerCase(),
+            humanStatus === 'trialing' ? 'Your free trial is active' : 'Your subscription is active',
+            `Your subscription is now ${humanStatus}.
+If you are on a trial, you won’t be charged until the trial ends. Plan: $29.99/month.`,
+            `<p>Your subscription is now <strong>${humanStatus}</strong>.</p>
+             <p>${humanStatus === 'trialing' ? 'You won’t be charged until the trial ends.' : ''} Plan: <strong>$29.99/month</strong>.</p>`
+          );
+        }
+
         break;
       }
 
@@ -257,6 +295,21 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `customer=${customerId} subscription=${sub.id}`
         });
 
+        // ADDED: Customer email — suspended if payment issue
+        if (status === 'past_due' || status === 'unpaid') {
+          const customerEmail = (await findUserByCustomerId(customerId))?.email;
+          if (customerEmail) {
+            await sendCustomerMail(
+              customerEmail.toLowerCase(),
+              'Action needed — Payment issue on your subscription',
+              `We were unable to process your payment. Please update your card to restore full access.
+Plan: $29.99/month.`,
+              `<p>We were unable to process your payment.</p>
+               <p>Please update your card on file to restore full access. Plan: <strong>$29.99/month</strong>.</p>`
+            );
+          }
+        }
+
         break;
       }
 
@@ -281,6 +334,20 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `customer=${customerId} subscription=${sub.id}`
         });
 
+        // ADDED: Customer email — canceled
+        {
+          const email = (await findUserByCustomerId(customerId))?.email;
+          if (email) {
+            await sendCustomerMail(
+              email.toLowerCase(),
+              'Your subscription has been canceled',
+              `Your MPS Invoice App subscription has been canceled. You will not be charged going forward.`,
+              `<p>Your <strong>MPS Invoice App</strong> subscription has been canceled.</p>
+               <p>You will not be charged going forward.</p>`
+            );
+          }
+        }
+
         break;
       }
 
@@ -301,6 +368,21 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `invoice=${inv.id} customer=${customerId}`
         });
 
+        // ADDED: Customer email — payment failed
+        {
+          const email = (await findUserByCustomerId(customerId))?.email;
+          if (email) {
+            await sendCustomerMail(
+              email.toLowerCase(),
+              'Payment failed — Please update your card',
+              `We couldn’t process your payment.
+Please update your payment method to avoid interruption. Plan: $29.99/month.`,
+              `<p>We couldn’t process your payment.</p>
+               <p>Please update your payment method to avoid interruption. Plan: <strong>$29.99/month</strong>.</p>`
+            );
+          }
+        }
+
         break;
       }
 
@@ -320,6 +402,22 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           priceId: inv.lines?.data?.[0]?.price?.id,
           extra: `invoice=${inv.id} customer=${customerId}`
         });
+
+        // ADDED: Customer email — payment succeeded
+        {
+          const email = (await findUserByCustomerId(customerId))?.email;
+          const amount = (inv.amount_paid || inv.amount_due || 0) / 100;
+          const link = inv?.hosted_invoice_url || inv?.invoice_pdf;
+          if (email) {
+            await sendCustomerMail(
+              email.toLowerCase(),
+              'Payment received — Thank you',
+              `We received your payment of $${amount.toFixed(2)}.${link ? ' Invoice: ' + link : ''}`,
+              `<p>We received your payment of <strong>$${amount.toFixed(2)}</strong>.</p>
+               ${link ? `<p><a href="${link}">View your invoice</a></p>` : ''}`
+            );
+          }
+        }
 
         break;
       }
@@ -367,6 +465,19 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           priceId,
           extra: `invoice=${invoiceId} customer=${customerId}`
         });
+
+        // ADDED: Customer email — payment received (new event)
+        {
+          const email = user?.email;
+          if (email) {
+            await sendCustomerMail(
+              email.toLowerCase(),
+              'Payment received — Thank you',
+              `We’ve received your payment. Thank you for staying with MPS Invoice App.`,
+              `<p>We’ve received your payment. Thank you for staying with <strong>MPS Invoice App</strong>.</p>`
+            );
+          }
+        }
 
         break;
       }
