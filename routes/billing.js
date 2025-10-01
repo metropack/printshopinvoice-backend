@@ -212,7 +212,7 @@ router.post('/cancel', async (req, res) => {
 
 /**
  * POST /api/billing/resume
- * Clear cancel at period end.
+ * Clear cancel_at_period_end on the most recent subscription (active or trialing).
  */
 router.post('/resume', async (req, res) => {
   try {
@@ -221,18 +221,44 @@ router.post('/resume', async (req, res) => {
       [req.user.id]
     );
     const customerId = rows[0]?.stripe_customer_id;
-    if (!customerId) return res.status(400).json({ error: 'No Stripe customer on file' });
+    if (!customerId) {
+      return res.status(400).json({ error: 'No Stripe customer on file' });
+    }
 
-    const subs = await stripe.subscriptions.list({ customer: customerId, status: 'active', limit: 1 });
+    // Don’t filter by status — get the most recent sub for this customer
+    const subs = await stripe.subscriptions.list({ customer: customerId, limit: 1 });
     const sub = subs.data[0];
-    if (!sub) return res.status(400).json({ error: 'No active subscription found' });
+    if (!sub) {
+      return res.status(400).json({ error: 'No subscription found for this customer' });
+    }
+
+    // If it’s already not set to cancel, tell the client it’s fine
+    if (!sub.cancel_at_period_end) {
+      return res.json({ ok: true, alreadyActive: true });
+    }
+
+    // Allow resuming for both trialing and active states
+    if (sub.status !== 'trialing' && sub.status !== 'active') {
+      return res.status(400).json({
+        error: `Cannot resume a ${sub.status} subscription.`
+      });
+    }
 
     await stripe.subscriptions.update(sub.id, { cancel_at_period_end: false });
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (err) {
-    console.error('billing/resume error:', err?.message || err);
-    res.status(500).json({ error: 'Unable to resume subscription' });
+    console.error('billing/resume error:', {
+      message: err?.message,
+      code: err?.code,
+      type: err?.type,
+      raw: err?.raw?.message,
+    });
+    return res.status(500).json({
+      error: 'Unable to resume subscription',
+      detail: err?.raw?.message || err?.message || null
+    });
   }
 });
+
 
 module.exports = router;
