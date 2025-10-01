@@ -147,6 +147,9 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
        * - store stripe_customer_id (cus_...)
        * - store stripe_subscription_id (sub_...)
        * - notify support
+       *
+       * We keep customer welcome email in `customer.subscription.created`
+       * to avoid double emails.
        */
       case 'checkout.session.completed': {
         const s = event.data.object;
@@ -218,6 +221,7 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
       /**
        * Keep DB in sync when the subscription changes.
        * Collapse to active/inactive for app logic and notify on important changes.
+       * Also email the *customer* when the subscription is first created (welcome/trial).
        */
       case 'customer.subscription.created': {
         const sub = event.data.object;
@@ -255,6 +259,30 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           status: newStatus,
           priceId,
           extra: `customer=${customerId} subscription=${sub.id}`
+        });
+
+        // 👇 Customer welcome / trial-start email
+        const trialEnds = sub.trial_end ? new Date(sub.trial_end * 1000) : null;
+        const trialText = trialEnds
+          ? `Your free trial has started and will end on ${trialEnds.toLocaleString()}. `
+          : '';
+        const billingText = `You can manage your subscription from your account page.`;
+
+        await notifyCustomer({
+          to: email,
+          subject: trialEnds
+            ? 'Welcome! Your free trial has started'
+            : 'Welcome! Your subscription is active',
+          text:
+            (trialText || 'Your subscription is active. ') +
+            billingText +
+            ` ${FRONTEND}/account.html`,
+          html: `
+            <p>Hi,</p>
+            <p>${trialText || 'Your subscription is now <strong>active</strong>.'}</p>
+            <p>${billingText} <a href="${FRONTEND}/account.html">Open your account</a>.</p>
+            <p>— Print Shop Invoice App</p>
+          `
         });
 
         break;
@@ -443,7 +471,7 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           );
         }
 
-        // Try to include a price id from the invoice
+        // Try to include a price id from the invoice and email
         let priceId = null;
         let email = null;
         try {
@@ -465,7 +493,6 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `invoice=${invoiceId} customer=${customerId}`
         });
 
-        // 👇 Customer email (optional duplicate to payment_succeeded)
         await notifyCustomer({
           to: email,
           subject: 'Payment received — thank you',
