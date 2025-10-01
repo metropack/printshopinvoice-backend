@@ -190,8 +190,11 @@ router.post('/register', async (req, res) => {
 /**
  * POST /api/auth/login
  */
+/**
+ * POST /api/auth/login
+ */
 router.post('/login', async (req, res) => {
-  const email = (req.body.email || '').trim();
+  const email = (req.body.email || '').trim().toLowerCase();
   const password = req.body.password || '';
 
   try {
@@ -202,17 +205,52 @@ router.post('/login', async (req, res) => {
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) return res.status(401).json({ error: 'Invalid credentials' });
 
+    // --- Gate login on subscription status (active or trialing only) ---
+    let status = user.subscription_status;
+
+    // Optional: refresh from Stripe to avoid stale DB state (if we know the customer)
+    try {
+      if (stripe && user.stripe_customer_id) {
+        const subs = await stripe.subscriptions.list({ customer: user.stripe_customer_id, limit: 1 });
+        const sub = subs.data[0];
+        if (sub) {
+          const isActiveLike = sub.status === 'active' || sub.status === 'trialing';
+          status = isActiveLike ? 'active' : 'inactive';
+
+          // Keep DB in sync (best-effort; don't block on failure)
+          await pool.query('UPDATE users SET subscription_status = $2 WHERE id = $1', [user.id, status]);
+        } else {
+          status = 'inactive';
+          await pool.query('UPDATE users SET subscription_status = $2 WHERE id = $1', [user.id, status]);
+        }
+      }
+    } catch (_) {
+      // If Stripe call fails, fall back to whatever is in the DB.
+    }
+
+    if (status !== 'active' && status !== 'trialing') {
+      return res.status(403).json({
+        error: 'Your subscription is inactive. Please resume or start a subscription to sign in.',
+        code: 'SUBSCRIPTION_INACTIVE'
+      });
+    }
+
+    // OK → issue token
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
     return res.json({
       token,
       userId: user.id,
-      subscription_status: user.subscription_status,
+      subscription_status: status,
     });
   } catch (err) {
     console.error('Login failed:', err);
     return res.status(500).json({ error: 'Login failed' });
   }
 });
+/**
+ * GET /api/auth/me
+ */
+
 
 /**
  * GET /api/auth/me
