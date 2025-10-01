@@ -13,6 +13,10 @@ const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
 // Raw body ONLY for this route
 const rawBody = express.raw({ type: 'application/json' });
 
+/* For links in customer emails */
+const FRONTEND =
+  (process.env.FRONTEND_URL || 'https://printshopinvoice.com').replace(/\/$/, '');
+
 /* ───────────────────────── Mail (Hostinger SMTP) ───────────────────────── */
 const MAIL_FROM =
   process.env.EMAIL_FROM || '"Print Shop Invoice App" <support@printshopinvoice.com>'; // what recipients see
@@ -57,16 +61,7 @@ async function sendMail({ to, subject, text, html }) {
   });
 }
 
-// ── ADDED: simple helper to email the customer using the same transporter ──
-async function sendCustomerMail(to, subject, text, html) {
-  if (!to) return;
-  try {
-    await sendMail({ to, subject, text, html });
-  } catch (e) {
-    console.warn('sendCustomerMail failed:', e?.message || e);
-  }
-}
-
+// Admin email
 async function notifySupport({ title, email, userId, status, priceId, extra }) {
   const subject = `${title}: ${email || '(no email)'}${status ? ` (${status})` : ''}`;
   const time = new Date().toISOString();
@@ -94,6 +89,16 @@ async function notifySupport({ title, email, userId, status, priceId, extra }) {
   }
 }
 
+// Customer email
+async function notifyCustomer({ to, subject, text, html }) {
+  if (!to) return;
+  try {
+    await sendMail({ to, subject, text, html });
+  } catch (e) {
+    console.warn('notifyCustomer failed:', e?.message || e);
+  }
+}
+
 /* ───────────────────────── DB helpers ───────────────────────── */
 async function findUserById(id) {
   const r = await pool.query('SELECT id, email FROM users WHERE id=$1', [id]);
@@ -106,6 +111,19 @@ async function findUserByEmail(email) {
 async function findUserByCustomerId(cusId) {
   const r = await pool.query('SELECT id, email FROM users WHERE stripe_customer_id=$1', [cusId]);
   return r.rows[0] || null;
+}
+
+/** Try to resolve an email for a Stripe customer id (DB first, then Stripe). */
+async function resolveEmailForCustomer(customerId) {
+  if (!customerId) return null;
+  const byDb = await findUserByCustomerId(customerId);
+  if (byDb?.email) return byDb.email;
+  try {
+    const c = await stripe.customers.retrieve(customerId);
+    return (c?.email || '').toLowerCase() || null;
+  } catch {
+    return null;
+  }
 }
 
 /* ───────────────────────── Webhook route ───────────────────────── */
@@ -194,21 +212,6 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `customer=${customerId} subscription=${subscriptionId}`
         });
 
-        // ADDED: Customer email — trial started / welcome
-        {
-          const toEmail = (rowUser?.email || email || '').toLowerCase();
-          await sendCustomerMail(
-            toEmail,
-            'Welcome — Your 1-day trial has started',
-            `Thanks for trying MPS Invoice App!
-You won’t be charged today. Your trial ends in 1 day and billing begins afterward at $29.99/month.
-Cancel anytime from your account settings.`,
-            `<p>Thanks for trying <strong>MPS Invoice App</strong>!</p>
-             <p>You won’t be charged today. Your trial runs for <strong>1 day</strong> and billing begins afterward at <strong>$29.99/month</strong>.</p>
-             <p>You can cancel anytime from your account settings.</p>`
-          );
-        }
-
         break;
       }
 
@@ -254,19 +257,6 @@ Cancel anytime from your account settings.`,
           extra: `customer=${customerId} subscription=${sub.id}`
         });
 
-        // ADDED: Customer email — created (trialing/active)
-        if (email) {
-          const humanStatus = status === 'trialing' ? 'trialing' : 'active';
-          await sendCustomerMail(
-            email.toLowerCase(),
-            humanStatus === 'trialing' ? 'Your free trial is active' : 'Your subscription is active',
-            `Your subscription is now ${humanStatus}.
-If you are on a trial, you won’t be charged until the trial ends. Plan: $29.99/month.`,
-            `<p>Your subscription is now <strong>${humanStatus}</strong>.</p>
-             <p>${humanStatus === 'trialing' ? 'You won’t be charged until the trial ends.' : ''} Plan: <strong>$29.99/month</strong>.</p>`
-          );
-        }
-
         break;
       }
 
@@ -295,21 +285,6 @@ If you are on a trial, you won’t be charged until the trial ends. Plan: $29.99
           extra: `customer=${customerId} subscription=${sub.id}`
         });
 
-        // ADDED: Customer email — suspended if payment issue
-        if (status === 'past_due' || status === 'unpaid') {
-          const customerEmail = (await findUserByCustomerId(customerId))?.email;
-          if (customerEmail) {
-            await sendCustomerMail(
-              customerEmail.toLowerCase(),
-              'Action needed — Payment issue on your subscription',
-              `We were unable to process your payment. Please update your card to restore full access.
-Plan: $29.99/month.`,
-              `<p>We were unable to process your payment.</p>
-               <p>Please update your card on file to restore full access. Plan: <strong>$29.99/month</strong>.</p>`
-            );
-          }
-        }
-
         break;
       }
 
@@ -326,31 +301,38 @@ Plan: $29.99/month.`,
           [customerId, sub.id]
         );
 
+        const user = await findUserByCustomerId(customerId);
+        const email = user?.email || (await resolveEmailForCustomer(customerId));
+
         await notifySupport({
           title: '❌ Subscription canceled',
-          email: (await findUserByCustomerId(customerId))?.email,
+          email,
           status: 'inactive',
           priceId: sub.items?.data?.[0]?.price?.id,
           extra: `customer=${customerId} subscription=${sub.id}`
         });
 
-        // ADDED: Customer email — canceled
-        {
-          const email = (await findUserByCustomerId(customerId))?.email;
-          if (email) {
-            await sendCustomerMail(
-              email.toLowerCase(),
-              'Your subscription has been canceled',
-              `Your MPS Invoice App subscription has been canceled. You will not be charged going forward.`,
-              `<p>Your <strong>MPS Invoice App</strong> subscription has been canceled.</p>
-               <p>You will not be charged going forward.</p>`
-            );
-          }
-        }
+        // 👇 Customer email
+        await notifyCustomer({
+          to: email,
+          subject: 'Your subscription has been canceled',
+          text:
+            'Your subscription has been canceled and will not renew. ' +
+            'If this was a mistake, you can restart your subscription from your account page.',
+          html: `
+            <p>Hi,</p>
+            <p>Your subscription has been <strong>canceled</strong> and will not renew.</p>
+            <p>If this was a mistake, you can restart from your <a href="${FRONTEND}/account.html">account page</a>.</p>
+            <p>— Print Shop Invoice App</p>
+          `
+        });
 
         break;
       }
 
+      /**
+       * Optional: mark inactive on failed payment, active on success.
+       */
       case 'invoice.payment_failed': {
         const inv = event.data.object;
         const customerId = inv.customer;
@@ -360,28 +342,33 @@ Plan: $29.99/month.`,
           [customerId]
         );
 
+        const email =
+          (await findUserByCustomerId(customerId))?.email ||
+          (inv.customer_email || '').toLowerCase() ||
+          (await resolveEmailForCustomer(customerId));
+
         await notifySupport({
           title: '⚠️ Payment failed',
-          email: (await findUserByCustomerId(customerId))?.email,
+          email,
           status: 'inactive',
           priceId: inv.lines?.data?.[0]?.price?.id,
           extra: `invoice=${inv.id} customer=${customerId}`
         });
 
-        // ADDED: Customer email — payment failed
-        {
-          const email = (await findUserByCustomerId(customerId))?.email;
-          if (email) {
-            await sendCustomerMail(
-              email.toLowerCase(),
-              'Payment failed — Please update your card',
-              `We couldn’t process your payment.
-Please update your payment method to avoid interruption. Plan: $29.99/month.`,
-              `<p>We couldn’t process your payment.</p>
-               <p>Please update your payment method to avoid interruption. Plan: <strong>$29.99/month</strong>.</p>`
-            );
-          }
-        }
+        // 👇 Customer email
+        await notifyCustomer({
+          to: email,
+          subject: 'Payment failed — action needed',
+          text:
+            'Your recent payment failed. Please update your card to keep your subscription active: ' +
+            `${FRONTEND}/account.html`,
+          html: `
+            <p>Hi,</p>
+            <p>Your recent payment <strong>failed</strong>. Please update your card to keep your subscription active.</p>
+            <p><a href="${FRONTEND}/account.html">Manage your billing</a></p>
+            <p>— Print Shop Invoice App</p>
+          `
+        });
 
         break;
       }
@@ -395,36 +382,46 @@ Please update your payment method to avoid interruption. Plan: $29.99/month.`,
           [customerId]
         );
 
+        const email =
+          (await findUserByCustomerId(customerId))?.email ||
+          (inv.customer_email || '').toLowerCase() ||
+          (await resolveEmailForCustomer(customerId));
+
         await notifySupport({
           title: '💸 Payment succeeded',
-          email: (await findUserByCustomerId(customerId))?.email,
+          email,
           status: 'active',
           priceId: inv.lines?.data?.[0]?.price?.id,
           extra: `invoice=${inv.id} customer=${customerId}`
         });
 
-        // ADDED: Customer email — payment succeeded
-        {
-          const email = (await findUserByCustomerId(customerId))?.email;
-          const amount = (inv.amount_paid || inv.amount_due || 0) / 100;
-          const link = inv?.hosted_invoice_url || inv?.invoice_pdf;
-          if (email) {
-            await sendCustomerMail(
-              email.toLowerCase(),
-              'Payment received — Thank you',
-              `We received your payment of $${amount.toFixed(2)}.${link ? ' Invoice: ' + link : ''}`,
-              `<p>We received your payment of <strong>$${amount.toFixed(2)}</strong>.</p>
-               ${link ? `<p><a href="${link}">View your invoice</a></p>` : ''}`
-            );
-          }
-        }
+        // 👇 Customer email
+        const amountDue =
+          typeof inv.amount_paid === 'number'
+            ? (inv.amount_paid / 100).toFixed(2) + ' ' + (inv.currency || '').toUpperCase()
+            : null;
+
+        await notifyCustomer({
+          to: email,
+          subject: 'Payment received — thank you',
+          text:
+            `Your payment was successful.` +
+            (amountDue ? ` Amount: ${amountDue}.` : '') +
+            ` You can view invoices from your account page.`,
+          html: `
+            <p>Hi,</p>
+            <p>Your payment was <strong>successful</strong>${amountDue ? ` (Amount: <strong>${amountDue}</strong>)` : ''}.</p>
+            <p>You can view or download your invoices from your <a href="${FRONTEND}/account.html">account page</a>.</p>
+            <p>— Print Shop Invoice App</p>
+          `
+        });
 
         break;
       }
 
-      /* ────────────────── ADDED: Newer event for paid invoices ────────────────── */
+      /* ────────────────── Optional newer event ────────────────── */
       case 'invoice_payment.paid': {
-        // New Stripe event (2025-05-28 API) when an invoice payment is successful
+        // Newer event when an invoice payment is successful (some API versions)
         const inpay = event.data.object; // type "invoice_payment"
         const invoiceId = inpay.invoice;
         let customerId = (inpay.payment && inpay.payment.customer) || inpay.customer || null;
@@ -448,40 +445,43 @@ Please update your payment method to avoid interruption. Plan: $29.99/month.`,
 
         // Try to include a price id from the invoice
         let priceId = null;
+        let email = null;
         try {
           if (invoiceId) {
             const inv = await stripe.invoices.retrieve(invoiceId);
             priceId = inv?.lines?.data?.[0]?.price?.id || null;
+            email =
+              (await findUserByCustomerId(inv.customer))?.email ||
+              (inv.customer_email || '').toLowerCase() ||
+              (await resolveEmailForCustomer(inv.customer));
           }
         } catch (_) {}
 
-        const user = customerId ? await findUserByCustomerId(customerId) : null;
-
         await notifySupport({
           title: '💸 Invoice payment (invoice_payment.paid)',
-          email: user?.email,
-          userId: user?.id,
+          email,
           status: 'active',
           priceId,
           extra: `invoice=${invoiceId} customer=${customerId}`
         });
 
-        // ADDED: Customer email — payment received (new event)
-        {
-          const email = user?.email;
-          if (email) {
-            await sendCustomerMail(
-              email.toLowerCase(),
-              'Payment received — Thank you',
-              `We’ve received your payment. Thank you for staying with MPS Invoice App.`,
-              `<p>We’ve received your payment. Thank you for staying with <strong>MPS Invoice App</strong>.</p>`
-            );
-          }
-        }
+        // 👇 Customer email (optional duplicate to payment_succeeded)
+        await notifyCustomer({
+          to: email,
+          subject: 'Payment received — thank you',
+          text:
+            'Your payment was successful. You can view invoices from your account page.',
+          html: `
+            <p>Hi,</p>
+            <p>Your payment was <strong>successful</strong>.</p>
+            <p>You can view invoices from your <a href="${FRONTEND}/account.html">account page</a>.</p>
+            <p>— Print Shop Invoice App</p>
+          `
+        });
 
         break;
       }
-      /* ───────────────────────────────────────────────────────────────────────── */
+      /* ────────────────────────────────────────────────────────── */
 
       default:
         // No-op for other events
