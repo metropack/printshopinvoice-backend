@@ -113,15 +113,30 @@ async function findUserByCustomerId(cusId) {
   return r.rows[0] || null;
 }
 
-/** Try to resolve an email for a Stripe customer id (DB first, then Stripe). */
+/** Robust email resolution: customer → subscription (expanded) → invoice → DB. */
 async function resolveEmailForCustomer(customerId) {
   if (!customerId) return null;
   const byDb = await findUserByCustomerId(customerId);
   if (byDb?.email) return byDb.email;
   try {
     const c = await stripe.customers.retrieve(customerId);
-    return (c?.email || '').toLowerCase() || null;
-  } catch {
+    if (c?.email) return String(c.email).toLowerCase();
+  } catch (_) {}
+  return null;
+}
+
+async function resolveEmailForSubscription(subId) {
+  try {
+    const sub = await stripe.subscriptions.retrieve(subId, {
+      expand: ['customer', 'latest_invoice'],
+    });
+    const fromCustomer = sub?.customer && sub.customer.email ? String(sub.customer.email).toLowerCase() : null;
+    const fromInvoice = sub?.latest_invoice && sub.latest_invoice.customer_email
+      ? String(sub.latest_invoice.customer_email).toLowerCase()
+      : null;
+    const viaCustomerId = sub?.customer && sub.customer.id ? await resolveEmailForCustomer(sub.customer.id) : null;
+    return fromCustomer || fromInvoice || viaCustomerId || null;
+  } catch (_) {
     return null;
   }
 }
@@ -147,9 +162,7 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
        * - store stripe_customer_id (cus_...)
        * - store stripe_subscription_id (sub_...)
        * - notify support
-       *
-       * We keep customer welcome email in `customer.subscription.created`
-       * to avoid double emails.
+       * - ✅ send customer welcome/trial email immediately (fallback)
        */
       case 'checkout.session.completed': {
         const s = event.data.object;
@@ -215,13 +228,26 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `customer=${customerId} subscription=${subscriptionId}`
         });
 
+        // ✅ Customer welcome/trial email right after Checkout, using the session email
+        await notifyCustomer({
+          to: rowUser?.email || email || (await resolveEmailForCustomer(customerId)),
+          subject: s.subscription ? 'Welcome! Your free trial has started' : 'Welcome!',
+          text:
+            'Thanks for signing up. Your subscription is now started (trial if applicable). ' +
+            `Manage it any time from your account: ${FRONTEND}/account.html`,
+          html: `
+            <p>Hi,</p>
+            <p>Thanks for signing up! Your subscription has started${s.subscription ? ' (free trial)' : ''}.</p>
+            <p>You can manage your subscription from your <a href="${FRONTEND}/account.html">account page</a>.</p>
+            <p>— Print Shop Invoice App</p>
+          `
+        });
+
         break;
       }
 
       /**
-       * Keep DB in sync when the subscription changes.
-       * Collapse to active/inactive for app logic and notify on important changes.
-       * Also email the *customer* when the subscription is first created (welcome/trial).
+       * DB sync + admin email; also customer welcome/trial email (primary path).
        */
       case 'customer.subscription.created': {
         const sub = event.data.object;
@@ -229,17 +255,11 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
         const status = sub.status; // trialing | active | ...
         const priceId = sub.items?.data?.[0]?.price?.id;
 
-        // Try to resolve user/email
+        // Resolve email robustly
         let user = await findUserByCustomerId(customerId);
-        let email = user?.email;
-
-        if (!email) {
-          try {
-            const customer = await stripe.customers.retrieve(customerId);
-            email = (customer.email || '').toLowerCase();
-            if (!user && email) user = await findUserByEmail(email);
-          } catch (_) {}
-        }
+        let email = user?.email
+          || (await resolveEmailForSubscription(sub.id))
+          || (await resolveEmailForCustomer(customerId));
 
         const newStatus =
           status === 'active' || status === 'trialing' ? 'active' : 'inactive';
@@ -261,7 +281,7 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `customer=${customerId} subscription=${sub.id}`
         });
 
-        // 👇 Customer welcome / trial-start email
+        // 👇 Customer welcome / trial-start email (primary)
         const trialEnds = sub.trial_end ? new Date(sub.trial_end * 1000) : null;
         const trialText = trialEnds
           ? `Your free trial has started and will end on ${trialEnds.toLocaleString()}. `
@@ -307,7 +327,7 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
 
         await notifySupport({
           title: '🔄 Subscription updated',
-          email: (await findUserByCustomerId(customerId))?.email,
+          email: (await resolveEmailForSubscription(sub.id)) || (await resolveEmailForCustomer(customerId)),
           status: newStatus,
           priceId,
           extra: `customer=${customerId} subscription=${sub.id}`
@@ -329,8 +349,9 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           [customerId, sub.id]
         );
 
-        const user = await findUserByCustomerId(customerId);
-        const email = user?.email || (await resolveEmailForCustomer(customerId));
+        const email =
+          (await resolveEmailForSubscription(sub.id)) ||
+          (await resolveEmailForCustomer(customerId));
 
         await notifySupport({
           title: '❌ Subscription canceled',
@@ -358,12 +379,10 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
         break;
       }
 
-      /**
-       * Optional: mark inactive on failed payment, active on success.
-       */
       case 'invoice.payment_failed': {
         const inv = event.data.object;
         const customerId = inv.customer;
+
         await pool.query(
           `UPDATE users SET subscription_status='inactive'
             WHERE stripe_customer_id=$1`,
@@ -371,7 +390,6 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
         );
 
         const email =
-          (await findUserByCustomerId(customerId))?.email ||
           (inv.customer_email || '').toLowerCase() ||
           (await resolveEmailForCustomer(customerId));
 
@@ -383,7 +401,6 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `invoice=${inv.id} customer=${customerId}`
         });
 
-        // 👇 Customer email
         await notifyCustomer({
           to: email,
           subject: 'Payment failed — action needed',
@@ -404,6 +421,7 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
       case 'invoice.payment_succeeded': {
         const inv = event.data.object;
         const customerId = inv.customer;
+
         await pool.query(
           `UPDATE users SET subscription_status='active'
             WHERE stripe_customer_id=$1`,
@@ -411,7 +429,6 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
         );
 
         const email =
-          (await findUserByCustomerId(customerId))?.email ||
           (inv.customer_email || '').toLowerCase() ||
           (await resolveEmailForCustomer(customerId));
 
@@ -423,8 +440,7 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           extra: `invoice=${inv.id} customer=${customerId}`
         });
 
-        // 👇 Customer email
-        const amountDue =
+        const amount =
           typeof inv.amount_paid === 'number'
             ? (inv.amount_paid / 100).toFixed(2) + ' ' + (inv.currency || '').toUpperCase()
             : null;
@@ -434,12 +450,12 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           subject: 'Payment received — thank you',
           text:
             `Your payment was successful.` +
-            (amountDue ? ` Amount: ${amountDue}.` : '') +
+            (amount ? ` Amount: ${amount}.` : '') +
             ` You can view invoices from your account page.`,
           html: `
             <p>Hi,</p>
-            <p>Your payment was <strong>successful</strong>${amountDue ? ` (Amount: <strong>${amountDue}</strong>)` : ''}.</p>
-            <p>You can view or download your invoices from your <a href="${FRONTEND}/account.html">account page</a>.</p>
+            <p>Your payment was <strong>successful</strong>${amount ? ` (Amount: <strong>${amount}</strong>)` : ''}.</p>
+            <p>You can view/download invoices from your <a href="${FRONTEND}/account.html">account page</a>.</p>
             <p>— Print Shop Invoice App</p>
           `
         });
@@ -447,14 +463,12 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
         break;
       }
 
-      /* ────────────────── Optional newer event ────────────────── */
+      /* Optional newer event (some API versions) */
       case 'invoice_payment.paid': {
-        // Newer event when an invoice payment is successful (some API versions)
         const inpay = event.data.object; // type "invoice_payment"
         const invoiceId = inpay.invoice;
         let customerId = (inpay.payment && inpay.payment.customer) || inpay.customer || null;
 
-        // Fallback: fetch invoice to get the customer id
         if (!customerId && invoiceId) {
           try {
             const inv = await stripe.invoices.retrieve(invoiceId);
@@ -462,7 +476,6 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           } catch (_) {}
         }
 
-        // Mark the user as active for that customer
         if (customerId) {
           await pool.query(
             `UPDATE users SET subscription_status='active'
@@ -471,7 +484,6 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
           );
         }
 
-        // Try to include a price id from the invoice and email
         let priceId = null;
         let email = null;
         try {
@@ -479,7 +491,6 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
             const inv = await stripe.invoices.retrieve(invoiceId);
             priceId = inv?.lines?.data?.[0]?.price?.id || null;
             email =
-              (await findUserByCustomerId(inv.customer))?.email ||
               (inv.customer_email || '').toLowerCase() ||
               (await resolveEmailForCustomer(inv.customer));
           }
@@ -496,8 +507,7 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
         await notifyCustomer({
           to: email,
           subject: 'Payment received — thank you',
-          text:
-            'Your payment was successful. You can view invoices from your account page.',
+          text: 'Your payment was successful. You can view invoices from your account page.',
           html: `
             <p>Hi,</p>
             <p>Your payment was <strong>successful</strong>.</p>
@@ -508,10 +518,8 @@ router.post('/stripe/webhook', rawBody, async (req, res) => {
 
         break;
       }
-      /* ────────────────────────────────────────────────────────── */
 
       default:
-        // No-op for other events
         break;
     }
 
