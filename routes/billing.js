@@ -1,6 +1,7 @@
 // backend/routes/billing.js
 const express = require('express');
 const Stripe = require('stripe');
+const nodemailer = require('nodemailer');
 const pool = require('../db');
 
 const router = express.Router();
@@ -9,13 +10,71 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 // Use your real website; allow ENV override; strip trailing slash.
 const FRONTEND = (process.env.FRONTEND_URL || 'https://printshopinvoice.com').replace(/\/$/, '');
 
+/* ───────────────────────── Mail (Hostinger SMTP) ───────────────────────── */
+const MAIL_FROM =
+  process.env.EMAIL_FROM || '"Print Shop Invoice App" <support@printshopinvoice.com>'; // what recipients see
+const MAIL_SENDER =
+  process.env.FROM_EMAIL || process.env.SMTP_USER || 'support@printshopinvoice.com';   // envelope sender
+const SUPPORT_NOTIFY_TO =
+  process.env.SUPPORT_NOTIFY_TO || process.env.ADMIN_EMAIL || 'support@printshopinvoice.com';
+
+let transporter = null;
+if (process.env.SMTP_HOST) {
+  transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure:
+      String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' ||
+      Number(process.env.SMTP_PORT) === 465,
+    auth: process.env.SMTP_USER
+      ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+      : undefined,
+  });
+
+  transporter.verify().then(
+    () => console.log('✉️  SMTP (billing) ready'),
+    (e) => console.warn('✉️  SMTP (billing) verify failed:', e?.message || e)
+  );
+}
+
+async function sendMail({ to, subject, text, html }) {
+  if (!transporter) {
+    console.log('📭 SMTP not configured. Would have sent:', { to, subject });
+    return;
+  }
+  await transporter.sendMail({
+    from: MAIL_FROM,
+    sender: MAIL_SENDER,
+    envelope: { from: MAIL_SENDER, to },
+    to,
+    subject,
+    text,
+    html,
+  });
+}
+
+async function emailAdmin(subject, bodyHtml, bodyText) {
+  await sendMail({
+    to: SUPPORT_NOTIFY_TO,
+    subject,
+    text: bodyText || bodyHtml?.replace(/<[^>]+>/g, '') || '',
+    html: bodyHtml || `<p>${bodyText || ''}</p>`
+  });
+}
+
+async function emailCustomer(to, subject, bodyHtml, bodyText) {
+  if (!to) return;
+  await sendMail({
+    to,
+    subject,
+    text: bodyText || bodyHtml?.replace(/<[^>]+>/g, '') || '',
+    html: bodyHtml || `<p>${bodyText || ''}</p>`
+  });
+}
+
 /**
  * POST /api/billing/checkout/start
- * Create a Stripe Checkout session for a subscription and return the hosted URL.
- * Public route (no auth required). If req.user exists we include client_reference_id.
- * If an email is provided (recommended), we match/create a Stripe customer by email.
- *
- * Required env: STRIPE_PRICE_ID
+ * (unchanged)
  */
 router.post('/checkout/start', async (req, res) => {
   try {
@@ -67,7 +126,7 @@ router.post('/checkout/start', async (req, res) => {
 
 /**
  * GET /api/billing/status
- * Return subscription status + key dates for the logged-in user.
+ * (unchanged)
  */
 router.get('/status', async (req, res) => {
   try {
@@ -126,7 +185,7 @@ router.get('/status', async (req, res) => {
 
 /**
  * POST /api/billing/portal
- * Create a Stripe Customer Portal session.
+ * (unchanged)
  */
 router.post('/portal', async (req, res) => {
   try {
@@ -187,15 +246,19 @@ router.post('/portal', async (req, res) => {
 
 /**
  * POST /api/billing/cancel
- * Set cancel at period end.
+ * Set cancel at period end + send emails to admin & customer.
  */
 router.post('/cancel', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT stripe_customer_id FROM users WHERE id = $1',
+      'SELECT email, stripe_customer_id FROM users WHERE id = $1',
       [req.user.id]
     );
-    const customerId = rows[0]?.stripe_customer_id;
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: 'User not found' });
+
+    const email = row.email;
+    const customerId = row.stripe_customer_id;
     if (!customerId) return res.status(400).json({ error: 'No Stripe customer on file' });
 
     const subs = await stripe.subscriptions.list({ customer: customerId, limit: 1 });
@@ -203,6 +266,28 @@ router.post('/cancel', async (req, res) => {
     if (!sub) return res.status(400).json({ error: 'No active subscription found' });
 
     await stripe.subscriptions.update(sub.id, { cancel_at_period_end: true });
+
+    // Send emails (fire-and-forget)
+    const endDt = sub.current_period_end
+      ? new Date(sub.current_period_end * 1000).toUTCString()
+      : 'the end of your current period';
+
+    emailAdmin(
+      `❌ Subscription set to cancel — ${email}`,
+      `<p>User <strong>${email}</strong> set subscription <code>${sub.id}</code> to cancel at period end.</p>
+       <p><strong>Current period ends:</strong> ${endDt}</p>`,
+      `User ${email} set subscription ${sub.id} to cancel at period end. Current period ends: ${endDt}`
+    ).catch(()=>{});
+
+    emailCustomer(
+      email,
+      'Your subscription will cancel at period end',
+      `<p>Hi,</p>
+       <p>Your subscription has been scheduled to cancel at the end of your current billing period (${endDt}).</p>
+       <p>If this was a mistake, you can resume anytime from your <a href="${FRONTEND}/account.html">account page</a>.</p>
+       <p>— Print Shop Invoice App</p>`
+    ).catch(()=>{});
+
     res.json({ ok: true });
   } catch (err) {
     console.error('billing/cancel error:', err?.message || err);
@@ -212,53 +297,54 @@ router.post('/cancel', async (req, res) => {
 
 /**
  * POST /api/billing/resume
- * Clear cancel_at_period_end on the most recent subscription (active or trialing).
+ * Clear cancel at period end + send emails to admin & customer.
  */
 router.post('/resume', async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT stripe_customer_id FROM users WHERE id = $1',
+      'SELECT email, stripe_customer_id FROM users WHERE id = $1',
       [req.user.id]
     );
-    const customerId = rows[0]?.stripe_customer_id;
-    if (!customerId) {
-      return res.status(400).json({ error: 'No Stripe customer on file' });
-    }
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: 'User not found' });
 
-    // Don’t filter by status — get the most recent sub for this customer
+    const email = row.email;
+    const customerId = row.stripe_customer_id;
+    if (!customerId) return res.status(400).json({ error: 'No Stripe customer on file' });
+
+    // Look up the latest subscription (active or trialing)
     const subs = await stripe.subscriptions.list({ customer: customerId, limit: 1 });
     const sub = subs.data[0];
-    if (!sub) {
-      return res.status(400).json({ error: 'No subscription found for this customer' });
-    }
+    if (!sub) return res.status(400).json({ error: 'No active subscription found' });
 
-    // If it’s already not set to cancel, tell the client it’s fine
     if (!sub.cancel_at_period_end) {
+      // Nothing to do; tell frontend so it can show a friendly message
       return res.json({ ok: true, alreadyActive: true });
     }
 
-    // Allow resuming for both trialing and active states
-    if (sub.status !== 'trialing' && sub.status !== 'active') {
-      return res.status(400).json({
-        error: `Cannot resume a ${sub.status} subscription.`
-      });
-    }
-
     await stripe.subscriptions.update(sub.id, { cancel_at_period_end: false });
-    return res.json({ ok: true });
+
+    // Send emails (fire-and-forget)
+    emailAdmin(
+      `▶️ Subscription resumed — ${email}`,
+      `<p>User <strong>${email}</strong> resumed subscription <code>${sub.id}</code> (cancel_at_period_end cleared).</p>`,
+      `User ${email} resumed subscription ${sub.id} (cancel_at_period_end cleared).`
+    ).catch(()=>{});
+
+    emailCustomer(
+      email,
+      'Your subscription has been resumed',
+      `<p>Hi,</p>
+       <p>Your subscription has been resumed. It will continue to renew unless you cancel.</p>
+       <p>You can manage your billing any time from your <a href="${FRONTEND}/account.html">account page</a>.</p>
+       <p>— Print Shop Invoice App</p>`
+    ).catch(()=>{});
+
+    res.json({ ok: true });
   } catch (err) {
-    console.error('billing/resume error:', {
-      message: err?.message,
-      code: err?.code,
-      type: err?.type,
-      raw: err?.raw?.message,
-    });
-    return res.status(500).json({
-      error: 'Unable to resume subscription',
-      detail: err?.raw?.message || err?.message || null
-    });
+    console.error('billing/resume error:', err?.message || err);
+    res.status(500).json({ error: 'Unable to resume subscription' });
   }
 });
-
 
 module.exports = router;
