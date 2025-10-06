@@ -6,14 +6,25 @@ const pool = require('../db');
 // Option A applies `authenticate` + `subscriptionGuard` at mount time in index.js,
 // so no per-file router.use(authenticate) is needed here.
 
+const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
+
 /**
  * POST /api/invoices
  * Creates a new invoice for the authenticated user.
  * - Stores customer_id inside customer_info JSON for future exact matching.
  * - Computes total using user's tax_rate (fallback 0.06).
+ * - Persists discount_type ('amount' | 'percent') and discount_value (number).
  */
 router.post('/', async (req, res) => {
-  const { customer_id, customer_info, variationItems, customItems } = req.body;
+  const {
+    customer_id,
+    customer_info,
+    variationItems,
+    customItems,
+    discount_type,   // 'amount' | 'percent' (optional)
+    discount_value,  // number (optional)
+  } = req.body || {};
+
   const userId = req.user.id;
 
   // normalize customer_info (accept object or JSON string)
@@ -25,6 +36,15 @@ router.post('/', async (req, res) => {
     return typeof val === 'object' ? { ...val } : {};
   };
 
+  // sanitize discount
+  let discType = discount_type === 'percent' ? 'percent' : 'amount';
+  let discVal = Number(discount_value) || 0;
+  if (discType === 'percent') {
+    discVal = clamp(discVal, 0, 100);
+  } else {
+    discVal = clamp(discVal, 0, 1e12);
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -35,17 +55,17 @@ router.post('/', async (req, res) => {
       safeCustomerInfo.id = customer_id;
     }
 
-    // Insert invoice header (total=0 initially)
+    // Insert invoice header (total=0 initially); persist discount columns
     const { rows: hdrRows } = await client.query(
-      `INSERT INTO invoices (user_id, customer_info, invoice_date, total)
-       VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), $3)
+      `INSERT INTO invoices (user_id, customer_info, invoice_date, total, discount_type, discount_value)
+       VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), $3, $4, $5)
        RETURNING id`,
-      [userId, safeCustomerInfo, 0]
+      [userId, safeCustomerInfo, 0, discType, discVal]
     );
     const invoiceId = hdrRows[0].id;
 
-    let total = 0;
-    let taxableTotal = 0;
+    let total = 0;         // subtotal (taxable + non-taxable)
+    let taxableTotal = 0;  // taxable subtotal only
 
     // Variation items
     for (const item of (variationItems || [])) {
@@ -100,9 +120,23 @@ router.post('/', async (req, res) => {
     );
     const taxRate = Number(rateRows[0]?.tax_rate ?? 0.06);
 
-    const finalTotal = Number.isFinite(total)
-      ? taxableTotal * (1 + taxRate) + (total - taxableTotal)
-      : 0;
+    // Compute final total with discount rules
+    const nonTaxableTotal = total - taxableTotal;
+    let finalTotal;
+
+    if (discType === 'amount') {
+      // $ discount: subtotals & tax are computed from original amounts; discount subtracts from grand total.
+      const baseGrand = taxableTotal * (1 + taxRate) + nonTaxableTotal;
+      const maxDisc = clamp(discVal, 0, baseGrand);
+      finalTotal = Math.max(0, baseGrand - maxDisc);
+    } else {
+      // % discount: apply pct to both subtotals; tax computed on discounted taxable subtotal.
+      const pct = clamp(discVal, 0, 100) / 100;
+      const taxableAfter = taxableTotal * (1 - pct);
+      const nonTaxAfter = nonTaxableTotal * (1 - pct);
+      const taxAfter = taxableAfter * taxRate;
+      finalTotal = taxableAfter + nonTaxAfter + taxAfter;
+    }
 
     await client.query(
       `UPDATE invoices
@@ -129,6 +163,7 @@ router.post('/', async (req, res) => {
  *  - ?customer_id=<id> : exact match by embedded customer_info.id
  *  - ?q=<text>        : fuzzy match on name/company/email/phone
  *  - no params        : returns all invoices for the user
+ * Returns discount_type & discount_value as well.
  */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
@@ -146,7 +181,9 @@ router.get('/', async (req, res) => {
           inv.id,
           inv.customer_info,
           inv.invoice_date,
-          ROUND(inv.total, 2) AS total
+          ROUND(inv.total, 2) AS total,
+          inv.discount_type,
+          inv.discount_value
         FROM invoices inv
         WHERE inv.user_id = $1
           AND (inv.customer_info::jsonb)->>'id' = $2
@@ -160,7 +197,9 @@ router.get('/', async (req, res) => {
           inv.id,
           inv.customer_info,
           inv.invoice_date,
-          ROUND(inv.total, 2) AS total
+          ROUND(inv.total, 2) AS total,
+          inv.discount_type,
+          inv.discount_value
         FROM invoices inv
         WHERE inv.user_id = $1
           AND (
@@ -179,7 +218,9 @@ router.get('/', async (req, res) => {
           inv.id,
           inv.customer_info,
           inv.invoice_date,
-          ROUND(inv.total, 2) AS total
+          ROUND(inv.total, 2) AS total,
+          inv.discount_type,
+          inv.discount_value
         FROM invoices inv
         WHERE inv.user_id = $1
         ORDER BY inv.invoice_date DESC
@@ -218,6 +259,39 @@ router.get('/', async (req, res) => {
   } catch (error) {
     console.error('❌ Invoices GET failed:', error);
     res.status(500).json({ error: 'Internal server error while fetching invoices' });
+  }
+});
+
+/**
+ * GET /api/invoices/:id
+ * Returns a single invoice header (including discount fields) after verifying ownership.
+ */
+router.get('/:id', async (req, res) => {
+  const invoiceId = req.params.id;
+  const userId = req.user.id;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT id,
+             customer_info,
+             invoice_date,
+             ROUND(total, 2) AS total,
+             discount_type,
+             discount_value
+        FROM invoices
+       WHERE id = $1 AND user_id = $2
+      `,
+      [invoiceId, userId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('❌ Invoice GET failed:', err);
+    res.status(500).json({ error: 'Failed to load invoice' });
   }
 });
 
