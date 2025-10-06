@@ -1,9 +1,36 @@
-﻿node_modules/
+﻿# dependencies
+node_modules/
+**/node_modules/
+
+# uploads/logs (skip if you intentionally version these)
 uploads/
 logs/
 *.log
+npm-debug.log*
+yarn-error.log*
+
+# data you likely don't want in git
+invoices/
+
+# env & secrets
 .env
 .env.*
 !.env.example
+
+# build/output
 dist/
 out/
+release/
+build/
+
+# caches/coverage
+.cache/
+.parcel-cache/
+.next/
+coverage/
+
+# editors/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
