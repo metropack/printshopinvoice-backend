@@ -133,7 +133,7 @@ router.post('/', async (req, res) => {
       // % discount: apply pct to both subtotals; tax computed on discounted taxable subtotal.
       const pct = clamp(discVal, 0, 100) / 100;
       const taxableAfter = taxableTotal * (1 - pct);
-      const nonTaxAfter = nonTaxableTotal * (1 - pct);
+      const nonTaxAfter  = nonTaxableTotal * (1 - pct);
       const taxAfter = taxableAfter * taxRate;
       finalTotal = taxableAfter + nonTaxAfter + taxAfter;
     }
