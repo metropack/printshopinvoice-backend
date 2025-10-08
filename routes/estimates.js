@@ -1,3 +1,4 @@
+// backend/routes/estimates.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
@@ -5,6 +6,7 @@ const authenticate = require('../middleware/authenticate');
 
 router.use(authenticate);
 
+const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
 const toString = (v) => (v == null ? '' : String(v));
 
 /**
@@ -409,7 +411,9 @@ router.get('/search/customers', async (req, res) => {
 
 /**
  * POST /api/estimates/:id/convert-to-invoice  (atomic)
- * - Carries over estimate notes into invoice notes.
+ * Accepts optional { discount_type, discount_value, notes }.
+ * - Carries estimate notes by default; request body notes override if provided.
+ * - Computes invoice total respecting discount rules.
  */
 router.post('/:id/convert-to-invoice', async (req, res) => {
   const estimateId = req.params.id;
@@ -419,11 +423,18 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
     return res.status(400).json({ error: 'Invalid estimate id' });
   }
 
+  // sanitize incoming discount/notes
+  const rawType = String(req.body?.discount_type || '').toLowerCase();
+  const discType = rawType === 'percent' ? 'percent' : 'amount';
+  let discVal = Number(req.body?.discount_value || 0);
+  if (discType === 'percent') discVal = clamp(discVal, 0, 100);
+  else discVal = clamp(discVal, 0, 1e12);
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Ensure ownership & load estimate header
+    // Ensure ownership & load estimate header (including notes)
     const { rows: estRows } = await client.query(
       `SELECT id, customer_info, notes
          FROM estimates
@@ -435,7 +446,9 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
     const customer_info = estRows[0].customer_info || {};
-    const estNotes = toString(estRows[0].notes || '').slice(0, 2000);
+    const carriedNotes = toString(estRows[0].notes || '');
+    // request body notes override; invoices can store longer text
+    const invNotes = toString(req.body?.notes ?? carriedNotes).slice(0, 2000);
 
     // Load estimate items
     const { rows: variationItems } = await client.query(
@@ -456,20 +469,22 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       [estimateId]
     );
 
-    // Create invoice header (notes carried over). Discount fields left default/null here.
+    // Create invoice header (will update total after computing)
     const { rows: invHdr } = await client.query(
-      `INSERT INTO invoices (user_id, customer_info, invoice_date, total, notes)
-       VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), 0, $3)
+      `INSERT INTO invoices (user_id, customer_info, invoice_date, total,
+                             discount_type, discount_value, notes)
+       VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), 0,
+               $3, $4, $5)
        RETURNING id`,
-      [userId, customer_info, estNotes]
+      [userId, customer_info, discType, discVal, invNotes]
     );
     const invoiceId = invHdr[0].id;
 
-    // Insert invoice items + compute totals
+    // Insert invoice items + compute subtotals
     let total = 0;
     let taxableTotal = 0;
 
-    // Variation items → invoice_items (taxable by default)
+    // Variation items → invoice_items (taxable)
     for (const it of variationItems) {
       const qty = Number(it.quantity || 1);
       const price = Number(it.price || 0);
@@ -493,7 +508,8 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       if (it.taxable) taxableTotal += line;
 
       await client.query(
-        `INSERT INTO custom_invoice_items (invoice_id, product_name, size, price, quantity, accessory, taxable)
+        `INSERT INTO custom_invoice_items
+           (invoice_id, product_name, size, price, quantity, accessory, taxable)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [invoiceId, it.product_name || '', it.size || '', price, qty, it.accessory || '', it.taxable]
       );
@@ -508,9 +524,21 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
     );
     const taxRate = Number(rateRows[0]?.tax_rate ?? 0.06);
 
-    const finalTotal = Number.isFinite(total)
-      ? taxableTotal * (1 + taxRate) + (total - taxableTotal)
-      : 0;
+    // Discount math identical to /api/invoices
+    const nonTaxableTotal = total - taxableTotal;
+    let finalTotal;
+
+    if (discType === 'amount') {
+      const baseGrand = taxableTotal * (1 + taxRate) + nonTaxableTotal;
+      const maxDisc = clamp(discVal, 0, baseGrand);
+      finalTotal = Math.max(0, baseGrand - maxDisc);
+    } else {
+      const pct = clamp(discVal, 0, 100) / 100;
+      const taxableAfter = taxableTotal * (1 - pct);
+      const nonTaxAfter  = nonTaxableTotal * (1 - pct);
+      const taxAfter     = taxableAfter * taxRate;
+      finalTotal = taxableAfter + nonTaxAfter + taxAfter;
+    }
 
     await client.query(
       `UPDATE invoices
