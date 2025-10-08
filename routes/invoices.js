@@ -1,8 +1,10 @@
+// backend/routes/invoices.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 
-// NOTE: auth/subscription guards assumed applied at mount time in index.js
+// Option A applies `authenticate` + `subscriptionGuard` at mount time in index.js,
+// so no per-file router.use(authenticate) is needed here.
 
 const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
 const toString = (v) => (v == null ? '' : String(v));
@@ -13,7 +15,7 @@ const toString = (v) => (v == null ? '' : String(v));
  * - Stores customer_id inside customer_info JSON for future exact matching.
  * - Computes total using user's tax_rate (fallback 0.06).
  * - Persists discount_type ('amount' | 'percent') and discount_value (number).
- * - Persists notes (up to ~2000 chars).
+ * - If source_estimate_id is provided (and belongs to the user), deletes that estimate + its items atomically.
  */
 router.post('/', async (req, res) => {
   const {
@@ -21,9 +23,10 @@ router.post('/', async (req, res) => {
     customer_info,
     variationItems,
     customItems,
-    discount_type,   // 'amount' | 'percent' (optional)
-    discount_value,  // number (optional)
-    notes            // string (optional)
+    discount_type,      // 'amount' | 'percent' (optional)
+    discount_value,     // number (optional)
+    notes,              // optional long text
+    source_estimate_id, // optional: delete this estimate after creating invoice
   } = req.body || {};
 
   const userId = req.user.id;
@@ -46,8 +49,8 @@ router.post('/', async (req, res) => {
     discVal = clamp(discVal, 0, 1e12);
   }
 
-  // sanitize notes (no hard cap in invoices, but keep reasonable)
   const cleanNotes = toString(notes).slice(0, 2000);
+  const srcEstId = Number(source_estimate_id);
 
   const client = await pool.connect();
   try {
@@ -59,7 +62,7 @@ router.post('/', async (req, res) => {
       safeCustomerInfo.id = customer_id;
     }
 
-    // Insert invoice header (total=0 initially); persist discount columns and notes
+    // Insert invoice header (total=0 initially); persist discount + notes
     const { rows: hdrRows } = await client.query(
       `INSERT INTO invoices (user_id, customer_info, invoice_date, total, discount_type, discount_value, notes)
        VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), $3, $4, $5, $6)
@@ -149,6 +152,19 @@ router.post('/', async (req, res) => {
       [finalTotal, invoiceId, userId]
     );
 
+    // If we were converting from an estimate, delete it (and its children) atomically.
+    if (Number.isFinite(srcEstId)) {
+      const { rowCount: own } = await client.query(
+        `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
+        [srcEstId, userId]
+      );
+      if (own > 0) {
+        await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [srcEstId]);
+        await client.query(`DELETE FROM custom_estimate_items WHERE estimate_id = $1`, [srcEstId]);
+        await client.query(`DELETE FROM estimates WHERE id = $1 AND user_id = $2`, [srcEstId, userId]);
+      }
+    }
+
     await client.query('COMMIT');
     res.status(201).json({ message: 'Invoice saved', invoiceId });
   } catch (error) {
@@ -167,7 +183,7 @@ router.post('/', async (req, res) => {
  *  - ?customer_id=<id> : exact match by embedded customer_info.id
  *  - ?q=<text>        : fuzzy match on name/company/email/phone
  *  - no params        : returns all invoices for the user
- * Returns discount_type, discount_value & notes as well.
+ * Returns discount_type, discount_value, and notes as well.
  */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
@@ -271,7 +287,7 @@ router.get('/', async (req, res) => {
 
 /**
  * GET /api/invoices/:id
- * Returns a single invoice header (including discount fields & notes) after verifying ownership.
+ * Returns a single invoice header (including discount fields) after verifying ownership.
  */
 router.get('/:id', async (req, res) => {
   const invoiceId = req.params.id;
@@ -300,37 +316,6 @@ router.get('/:id', async (req, res) => {
   } catch (err) {
     console.error('❌ Invoice GET failed:', err);
     res.status(500).json({ error: 'Failed to load invoice' });
-  }
-});
-
-/**
- * PATCH /api/invoices/:id/notes
- * Updates the notes for a single invoice.
- * Body: { notes: string }
- */
-router.patch('/:id/notes', async (req, res) => {
-  const invoiceId = req.params.id;
-  const userId = req.user.id;
-  const cleanNotes = toString(req.body?.notes).slice(0, 2000);
-
-  try {
-    const check = await pool.query(
-      `SELECT 1 FROM invoices WHERE id = $1 AND user_id = $2`,
-      [invoiceId, userId]
-    );
-    if (check.rowCount === 0) {
-      return res.status(404).json({ error: 'Invoice not found' });
-    }
-
-    await pool.query(
-      `UPDATE invoices SET notes = $1 WHERE id = $2 AND user_id = $3`,
-      [cleanNotes, invoiceId, userId]
-    );
-
-    res.json({ message: 'Notes updated' });
-  } catch (err) {
-    console.error('❌ Update invoice notes failed:', err);
-    res.status(500).json({ error: 'Failed to update notes' });
   }
 });
 
