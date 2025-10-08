@@ -1,12 +1,11 @@
-// backend/routes/invoices.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 
-// Option A applies `authenticate` + `subscriptionGuard` at mount time in index.js,
-// so no per-file router.use(authenticate) is needed here.
+// NOTE: auth/subscription guards assumed applied at mount time in index.js
 
 const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
+const toString = (v) => (v == null ? '' : String(v));
 
 /**
  * POST /api/invoices
@@ -14,6 +13,7 @@ const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
  * - Stores customer_id inside customer_info JSON for future exact matching.
  * - Computes total using user's tax_rate (fallback 0.06).
  * - Persists discount_type ('amount' | 'percent') and discount_value (number).
+ * - Persists notes (up to ~2000 chars).
  */
 router.post('/', async (req, res) => {
   const {
@@ -23,6 +23,7 @@ router.post('/', async (req, res) => {
     customItems,
     discount_type,   // 'amount' | 'percent' (optional)
     discount_value,  // number (optional)
+    notes            // string (optional)
   } = req.body || {};
 
   const userId = req.user.id;
@@ -45,6 +46,9 @@ router.post('/', async (req, res) => {
     discVal = clamp(discVal, 0, 1e12);
   }
 
+  // sanitize notes (no hard cap in invoices, but keep reasonable)
+  const cleanNotes = toString(notes).slice(0, 2000);
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -55,12 +59,12 @@ router.post('/', async (req, res) => {
       safeCustomerInfo.id = customer_id;
     }
 
-    // Insert invoice header (total=0 initially); persist discount columns
+    // Insert invoice header (total=0 initially); persist discount columns and notes
     const { rows: hdrRows } = await client.query(
-      `INSERT INTO invoices (user_id, customer_info, invoice_date, total, discount_type, discount_value)
-       VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), $3, $4, $5)
+      `INSERT INTO invoices (user_id, customer_info, invoice_date, total, discount_type, discount_value, notes)
+       VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), $3, $4, $5, $6)
        RETURNING id`,
-      [userId, safeCustomerInfo, 0, discType, discVal]
+      [userId, safeCustomerInfo, 0, discType, discVal, cleanNotes]
     );
     const invoiceId = hdrRows[0].id;
 
@@ -163,7 +167,7 @@ router.post('/', async (req, res) => {
  *  - ?customer_id=<id> : exact match by embedded customer_info.id
  *  - ?q=<text>        : fuzzy match on name/company/email/phone
  *  - no params        : returns all invoices for the user
- * Returns discount_type & discount_value as well.
+ * Returns discount_type, discount_value & notes as well.
  */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
@@ -183,7 +187,8 @@ router.get('/', async (req, res) => {
           inv.invoice_date,
           ROUND(inv.total, 2) AS total,
           inv.discount_type,
-          inv.discount_value
+          inv.discount_value,
+          inv.notes
         FROM invoices inv
         WHERE inv.user_id = $1
           AND (inv.customer_info::jsonb)->>'id' = $2
@@ -199,7 +204,8 @@ router.get('/', async (req, res) => {
           inv.invoice_date,
           ROUND(inv.total, 2) AS total,
           inv.discount_type,
-          inv.discount_value
+          inv.discount_value,
+          inv.notes
         FROM invoices inv
         WHERE inv.user_id = $1
           AND (
@@ -220,7 +226,8 @@ router.get('/', async (req, res) => {
           inv.invoice_date,
           ROUND(inv.total, 2) AS total,
           inv.discount_type,
-          inv.discount_value
+          inv.discount_value,
+          inv.notes
         FROM invoices inv
         WHERE inv.user_id = $1
         ORDER BY inv.invoice_date DESC
@@ -264,7 +271,7 @@ router.get('/', async (req, res) => {
 
 /**
  * GET /api/invoices/:id
- * Returns a single invoice header (including discount fields) after verifying ownership.
+ * Returns a single invoice header (including discount fields & notes) after verifying ownership.
  */
 router.get('/:id', async (req, res) => {
   const invoiceId = req.params.id;
@@ -278,7 +285,8 @@ router.get('/:id', async (req, res) => {
              invoice_date,
              ROUND(total, 2) AS total,
              discount_type,
-             discount_value
+             discount_value,
+             notes
         FROM invoices
        WHERE id = $1 AND user_id = $2
       `,
@@ -292,6 +300,37 @@ router.get('/:id', async (req, res) => {
   } catch (err) {
     console.error('❌ Invoice GET failed:', err);
     res.status(500).json({ error: 'Failed to load invoice' });
+  }
+});
+
+/**
+ * PATCH /api/invoices/:id/notes
+ * Updates the notes for a single invoice.
+ * Body: { notes: string }
+ */
+router.patch('/:id/notes', async (req, res) => {
+  const invoiceId = req.params.id;
+  const userId = req.user.id;
+  const cleanNotes = toString(req.body?.notes).slice(0, 2000);
+
+  try {
+    const check = await pool.query(
+      `SELECT 1 FROM invoices WHERE id = $1 AND user_id = $2`,
+      [invoiceId, userId]
+    );
+    if (check.rowCount === 0) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    await pool.query(
+      `UPDATE invoices SET notes = $1 WHERE id = $2 AND user_id = $3`,
+      [cleanNotes, invoiceId, userId]
+    );
+
+    res.json({ message: 'Notes updated' });
+  } catch (err) {
+    console.error('❌ Update invoice notes failed:', err);
+    res.status(500).json({ error: 'Failed to update notes' });
   }
 });
 

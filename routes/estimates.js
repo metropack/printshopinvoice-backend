@@ -1,4 +1,3 @@
-// backend/routes/estimates.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
@@ -6,9 +5,12 @@ const authenticate = require('../middleware/authenticate');
 
 router.use(authenticate);
 
-// -----------------------------------------------
-// GET /api/estimates - Fetch list of estimates (only mine)
-// -----------------------------------------------
+const toString = (v) => (v == null ? '' : String(v));
+
+/**
+ * GET /api/estimates - Fetch list of estimates (only mine)
+ * Returns notes as well (max 150 chars stored).
+ */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
 
@@ -18,7 +20,8 @@ router.get('/', async (req, res) => {
          e.id,
          e.customer_info,
          e.estimate_date,
-         ROUND(e.total, 2) AS total
+         ROUND(e.total, 2) AS total,
+         e.notes
        FROM estimates e
        WHERE e.user_id = $1
        ORDER BY e.estimate_date DESC`,
@@ -32,22 +35,28 @@ router.get('/', async (req, res) => {
   }
 });
 
-// ------------------------------------------------
-// POST /api/estimates - Create a new estimate (only mine)
-//  - Variation items: taxable by default
-//  - Custom items: respects taxable flag
-//  - Total uses the user's saved store tax rate (fallback 0.06)
-// ------------------------------------------------
+/**
+ * POST /api/estimates - Create a new estimate (only mine)
+ * - Variation items: taxable by default
+ * - Custom items: respects taxable flag
+ * - Total uses the user's saved store tax rate (fallback 0.06)
+ * - Persists notes (REQUIRED max 150 chars, trimmed)
+ */
 router.post('/', async (req, res) => {
   const userId = req.user.id;
-  const { customer_id, customer_info, variationItems = [], customItems = [] } = req.body || {};
+  const { customer_id, customer_info, variationItems = [], customItems = [], notes } = req.body || {};
+
+  let cleanNotes = toString(notes).trim();
+  if (cleanNotes.length > 150) {
+    return res.status(400).json({ error: 'Notes must be 150 characters or fewer.' });
+  }
 
   try {
     const insertEstimate = await pool.query(
-      `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total)
-       VALUES ($1, $2, $3, NOW(), $4)
+      `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes)
+       VALUES ($1, $2, $3, NOW(), $4, $5)
        RETURNING id`,
-      [userId, customer_id ?? null, customer_info || {}, 0]
+      [userId, customer_id ?? null, customer_info || {}, 0, cleanNotes]
     );
 
     const estimateId = insertEstimate.rows[0].id;
@@ -122,17 +131,23 @@ router.post('/', async (req, res) => {
   }
 });
 
-// ----------------------------------------------------
-// PUT /api/estimates/:id - Update an existing estimate in place
-//  - Replaces items, recomputes total with user's tax rate
-// ----------------------------------------------------
+/**
+ * PUT /api/estimates/:id - Update an existing estimate in place
+ * - Replaces items, recomputes total with user's tax rate
+ * - Updates notes (still max 150 chars)
+ */
 router.put('/:id', async (req, res) => {
   const userId = req.user.id;
   const estimateId = parseInt(req.params.id, 10);
-  const { customer_info, variationItems = [], customItems = [] } = req.body || {};
+  const { customer_info, variationItems = [], customItems = [], notes } = req.body || {};
 
   if (!Number.isFinite(estimateId)) {
     return res.status(400).json({ error: 'Invalid estimate id' });
+  }
+
+  let cleanNotes = toString(notes).trim();
+  if (cleanNotes.length > 150) {
+    return res.status(400).json({ error: 'Notes must be 150 characters or fewer.' });
   }
 
   const client = await pool.connect();
@@ -149,13 +164,14 @@ router.put('/:id', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    // Update header (also refresh date so it bubbles to the top)
+    // Update header (also refresh date so it bubbles to the top), include notes
     await client.query(
       `UPDATE estimates
          SET customer_info = $1,
-             estimate_date = NOW()
-       WHERE id = $2 AND user_id = $3`,
-      [customer_info || {}, estimateId, userId]
+             estimate_date = NOW(),
+             notes = $2
+       WHERE id = $3 AND user_id = $4`,
+      [customer_info || {}, cleanNotes, estimateId, userId]
     );
 
     // Replace children
@@ -227,9 +243,42 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-// ----------------------------------------------------
-// GET /api/estimates/:id/items - Load estimate items (only mine)
-// ----------------------------------------------------
+/**
+ * PATCH /api/estimates/:id/notes - Update notes only (max 150 chars)
+ */
+router.patch('/:id/notes', async (req, res) => {
+  const estimateId = req.params.id;
+  const userId = req.user.id;
+
+  let cleanNotes = toString(req.body?.notes).trim();
+  if (cleanNotes.length > 150) {
+    return res.status(400).json({ error: 'Notes must be 150 characters or fewer.' });
+  }
+
+  try {
+    const check = await pool.query(
+      `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
+      [estimateId, userId]
+    );
+    if (check.rowCount === 0) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    await pool.query(
+      `UPDATE estimates SET notes = $1 WHERE id = $2 AND user_id = $3`,
+      [cleanNotes, estimateId, userId]
+    );
+
+    res.json({ message: 'Notes updated' });
+  } catch (err) {
+    console.error("❌ Error updating estimate notes:", err);
+    res.status(500).json({ error: 'Failed to update notes' });
+  }
+});
+
+/**
+ * GET /api/estimates/:id/items - Load estimate items (only mine)
+ */
 router.get('/:id/items', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -295,9 +344,9 @@ router.get('/:id/items', async (req, res) => {
   }
 });
 
-// -----------------------------------------------------
-// DELETE /api/estimates/:id - Delete an estimate (only mine)
-// -----------------------------------------------------
+/**
+ * DELETE /api/estimates/:id - Delete an estimate (only mine)
+ */
 router.delete('/:id', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -334,10 +383,9 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-// -------------------------------------------------------
-// GET /api/estimates/search/customers - autocomplete (only mine)
-// (kept from your original file)
-// -------------------------------------------------------
+/**
+ * GET /api/estimates/search/customers - autocomplete (only mine)
+ */
 router.get('/search/customers', async (req, res) => {
   const search = req.query.q || '';
   const userId = req.user.id;
@@ -359,10 +407,10 @@ router.get('/search/customers', async (req, res) => {
   }
 });
 
-// -------------------------------------------------------
-// POST /api/estimates/:id/convert-to-invoice  (atomic)
-// (kept from your original file, unchanged except formatting)
-// -------------------------------------------------------
+/**
+ * POST /api/estimates/:id/convert-to-invoice  (atomic)
+ * - Carries over estimate notes into invoice notes.
+ */
 router.post('/:id/convert-to-invoice', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -377,7 +425,7 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
 
     // Ensure ownership & load estimate header
     const { rows: estRows } = await client.query(
-      `SELECT id, customer_info
+      `SELECT id, customer_info, notes
          FROM estimates
         WHERE id = $1 AND user_id = $2`,
       [estimateId, userId]
@@ -387,6 +435,7 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
     const customer_info = estRows[0].customer_info || {};
+    const estNotes = toString(estRows[0].notes || '').slice(0, 2000);
 
     // Load estimate items
     const { rows: variationItems } = await client.query(
@@ -407,12 +456,12 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       [estimateId]
     );
 
-    // Create invoice header
+    // Create invoice header (notes carried over). Discount fields left default/null here.
     const { rows: invHdr } = await client.query(
-      `INSERT INTO invoices (user_id, customer_info, invoice_date, total)
-       VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), 0)
+      `INSERT INTO invoices (user_id, customer_info, invoice_date, total, notes)
+       VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), 0, $3)
        RETURNING id`,
-      [userId, customer_info]
+      [userId, customer_info, estNotes]
     );
     const invoiceId = invHdr[0].id;
 
