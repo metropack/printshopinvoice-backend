@@ -321,15 +321,16 @@ const { rows: variationItems } = await pool.query(
     const { rows: customItems } = await pool.query(
       `
       SELECT
-        product_name,
-        size,
-        price::numeric(12,2)  AS price,
-        quantity,
-        accessory,
-        (CASE WHEN taxable IN (TRUE, 'true', 1) THEN TRUE ELSE FALSE END) AS taxable
-      FROM custom_estimate_items
-      WHERE estimate_id = $1
-      ORDER BY id ASC
+  product_name,
+  size,
+  price::numeric(12,2) AS price,
+  quantity,
+  accessory,
+  COALESCE(taxable, TRUE) AS taxable
+FROM custom_estimate_items
+WHERE estimate_id = $1
+ORDER BY id ASC
+
       `,
       [estimateId]
     );
@@ -458,14 +459,21 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       [estimateId]
     );
 
-    const { rows: custItems } = await client.query(
-      `SELECT product_name, size, price, quantity, accessory,
-              (CASE WHEN taxable IN (TRUE, 'true', 1) THEN TRUE ELSE FALSE END) AS taxable
-         FROM custom_estimate_items
-        WHERE estimate_id = $1
-        ORDER BY id ASC`,
-      [estimateId]
-    );
+   // 1) In convert-to-invoice (reading custom estimate lines)
+const { rows: custItems } = await client.query(
+  `SELECT
+     product_name,
+     size,
+     price::numeric(12,2) AS price,
+     quantity,
+     accessory,
+     COALESCE(taxable, TRUE) AS taxable
+   FROM custom_estimate_items
+   WHERE estimate_id = $1
+   ORDER BY id ASC`,
+  [estimateId]
+);
+
 
     let taxableSubtotal = 0;
     let nonTaxableSubtotal = 0;

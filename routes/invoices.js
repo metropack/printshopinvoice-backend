@@ -288,15 +288,22 @@ router.get('/:id/items', async (req, res) => {
 );
 
 
-    const { rows: customItems } = await pool.query(
-      `SELECT
-         id AS line_id, product_name, size, price, quantity, accessory,
-         (CASE WHEN taxable IN (TRUE, 'true', 1) THEN TRUE ELSE FALSE END) AS taxable
-       FROM custom_invoice_items
-       WHERE invoice_id = $1
-       ORDER BY id ASC`,
-      [invoiceId]
-    );
+ // 2) In GET /api/invoices/:id/items (custom invoice lines)
+const { rows: customItems } = await pool.query(
+  `SELECT
+     id AS line_id,
+     product_name,
+     size,
+     price::numeric(12,2) AS price,
+     quantity,
+     accessory,
+     COALESCE(taxable, TRUE) AS taxable
+   FROM custom_invoice_items
+   WHERE invoice_id = $1
+   ORDER BY id ASC`,
+  [invoiceId]
+);
+
 
     const combinedItems = [
       ...variationItems.map(v => ({
