@@ -1,3 +1,4 @@
+// backend/routes/estimates.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
@@ -7,8 +8,6 @@ router.use(authenticate);
 
 const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
 const toString = (v) => (v == null ? '' : String(v));
-
-// Small helper so we can safely read bools sent as strings
 const toBool = (v, def = true) => {
   if (typeof v === 'boolean') return v;
   if (v == null) return def;
@@ -17,10 +16,7 @@ const toBool = (v, def = true) => {
   return def;
 };
 
-/**
- * GET /api/estimates - Fetch list of estimates (current user only)
- * Returns notes too.
- */
+/** GET /api/estimates — list, mine only */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
 
@@ -46,12 +42,11 @@ router.get('/', async (req, res) => {
 });
 
 /**
- * POST /api/estimates - Create a new estimate (current user)
- * - Built-in items are stored line-by-line in estimate_items (NO DEDUP).
- * - Allows per-line overrides: unit_price, taxable, display_name.
- * - Custom items go to custom_estimate_items with their own taxable flag.
- * - Total uses store tax_rate (default 0.06).
- * - Notes capped at 150 chars.
+ * POST /api/estimates
+ * - one row per built-in selection (NO DEDUP)
+ * - allows per-line overrides: unit_price, taxable, display_name
+ * - custom lines preserved with taxable flag
+ * - notes ≤ 150 chars
  */
 router.post('/', async (req, res) => {
   const userId = req.user.id;
@@ -72,7 +67,6 @@ router.post('/', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Header
     const { rows: estRows } = await client.query(
       `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes)
        VALUES ($1, $2, $3, NOW(), 0, $4)
@@ -84,21 +78,21 @@ router.post('/', async (req, res) => {
     let taxableSubtotal = 0;
     let nonTaxableSubtotal = 0;
 
-    // Built-in items: one row per selection (even if same variation appears multiple times)
+    // Built-in lines
     for (const it of (Array.isArray(variationItems) ? variationItems : [])) {
       const variationId = Number(it.variation_id ?? it.variationId);
       if (!Number.isFinite(variationId)) continue;
 
       const qty = Math.max(1, parseInt(it.quantity, 10) || 1);
 
-      // Allow overriding the built-in price/desc/taxable at the line level
+      // overrides (unit_price, taxable, display_name)
       const overridePrice = it.unit_price != null ? Number(it.unit_price) : Number(it.price);
-      const useOverridePrice = Number.isFinite(overridePrice);
+      const hasOverridePrice = Number.isFinite(overridePrice);
       const displayName = toString(it.display_name || it.product_name || '').trim() || null;
       const taxable = toBool(it.taxable, true);
 
-      // If no unit price override was given, pull current PV price
-      let lineUnitPrice = useOverridePrice ? overridePrice : null;
+      // fall back to PV price if no override
+      let lineUnitPrice = hasOverridePrice ? overridePrice : null;
       if (lineUnitPrice == null) {
         const { rows: priceRows } = await client.query(
           `SELECT price FROM product_variations WHERE id = $1`,
@@ -108,8 +102,7 @@ router.post('/', async (req, res) => {
       }
 
       const lineTotal = lineUnitPrice * qty;
-      if (taxable) taxableSubtotal += lineTotal;
-      else nonTaxableSubtotal += lineTotal;
+      (taxable ? (taxableSubtotal += lineTotal) : (nonTaxableSubtotal += lineTotal));
 
       await client.query(
         `INSERT INTO estimate_items
@@ -119,14 +112,13 @@ router.post('/', async (req, res) => {
       );
     }
 
-    // Custom items
+    // Custom lines
     for (const it of (Array.isArray(customItems) ? customItems : [])) {
       const qty = Math.max(1, parseInt(it.quantity, 10) || 1);
       const price = Number(it.price) || 0;
       const taxable = toBool(it.taxable, true);
 
-      if (taxable) taxableSubtotal += price * qty;
-      else nonTaxableSubtotal += price * qty;
+      (taxable ? (taxableSubtotal += price * qty) : (nonTaxableSubtotal += price * qty));
 
       await client.query(
         `INSERT INTO custom_estimate_items
@@ -144,7 +136,7 @@ router.post('/', async (req, res) => {
       );
     }
 
-    // Tax rate
+    // tax
     const { rows: rateRows } = await client.query(
       `SELECT COALESCE(tax_rate, 0.06) AS tax_rate
          FROM store_info
@@ -170,9 +162,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-/**
- * PUT /api/estimates/:id - Replace items in place (keeps duplicates)
- */
+/** PUT /api/estimates/:id — replace children (keeps duplicates) */
 router.put('/:id', async (req, res) => {
   const userId = req.user.id;
   const estimateId = parseInt(req.params.id, 10);
@@ -191,7 +181,6 @@ router.put('/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Ownership
     const { rowCount } = await client.query(
       `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
       [estimateId, userId]
@@ -216,18 +205,17 @@ router.put('/:id', async (req, res) => {
     let taxableSubtotal = 0;
     let nonTaxableSubtotal = 0;
 
-    // Re-insert all built-ins (line-by-line, no dedup)
     for (const it of (Array.isArray(variationItems) ? variationItems : [])) {
       const variationId = Number(it.variation_id ?? it.variationId);
       if (!Number.isFinite(variationId)) continue;
 
       const qty = Math.max(1, parseInt(it.quantity, 10) || 1);
       const overridePrice = it.unit_price != null ? Number(it.unit_price) : Number(it.price);
-      const useOverridePrice = Number.isFinite(overridePrice);
+      const hasOverridePrice = Number.isFinite(overridePrice);
       const displayName = toString(it.display_name || it.product_name || '').trim() || null;
       const taxable = toBool(it.taxable, true);
 
-      let lineUnitPrice = useOverridePrice ? overridePrice : null;
+      let lineUnitPrice = hasOverridePrice ? overridePrice : null;
       if (lineUnitPrice == null) {
         const { rows: priceRows } = await client.query(
           `SELECT price FROM product_variations WHERE id = $1`,
@@ -237,8 +225,7 @@ router.put('/:id', async (req, res) => {
       }
 
       const lineTotal = lineUnitPrice * qty;
-      if (taxable) taxableSubtotal += lineTotal;
-      else nonTaxableSubtotal += lineTotal;
+      (taxable ? (taxableSubtotal += lineTotal) : (nonTaxableSubtotal += lineTotal));
 
       await client.query(
         `INSERT INTO estimate_items
@@ -253,8 +240,7 @@ router.put('/:id', async (req, res) => {
       const price = Number(it.price) || 0;
       const taxable = toBool(it.taxable, true);
 
-      if (taxable) taxableSubtotal += price * qty;
-      else nonTaxableSubtotal += price * qty;
+      (taxable ? (taxableSubtotal += price * qty) : (nonTaxableSubtotal += price * qty));
 
       await client.query(
         `INSERT INTO custom_estimate_items
@@ -297,16 +283,12 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-/**
- * GET /api/estimates/:id/items - Load estimate items (NO DEDUP, includes line_id)
- */
-// GET /api/estimates/:id/items
+/** GET /api/estimates/:id/items — NO DEDUP, overrides coalesced, ordered by line id */
 router.get('/:id/items', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
 
   try {
-    // Ownership
     const own = await pool.query(
       `SELECT 1 FROM estimates WHERE id=$1 AND user_id=$2`,
       [estimateId, userId]
@@ -315,7 +297,6 @@ router.get('/:id/items', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    // Built-in (variation) lines with overrides
     const { rows: variationItems } = await pool.query(
       `
       SELECT
@@ -335,7 +316,6 @@ router.get('/:id/items', async (req, res) => {
       [estimateId]
     );
 
-    // Custom lines unchanged
     const { rows: customItems } = await pool.query(
       `
       SELECT
@@ -388,10 +368,7 @@ router.get('/:id/items', async (req, res) => {
   }
 });
 
-
-/**
- * DELETE /api/estimates/:id
- */
+/** DELETE /api/estimates/:id */
 router.delete('/:id', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -422,7 +399,7 @@ router.delete('/:id', async (req, res) => {
 
 /**
  * POST /api/estimates/:id/convert-to-invoice
- * (keeps duplicates 1:1)
+ * Keeps duplicates 1:1, carries edited name/price/taxable.
  */
 router.post('/:id/convert-to-invoice', async (req, res) => {
   const estimateId = req.params.id;
@@ -463,7 +440,7 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
     );
     const invoiceId = invRows[0].id;
 
-    // Load estimate items (with overrides) and copy 1:1
+    // Copy variation lines with overrides coalesced
     const { rows: varItems } = await client.query(
       `SELECT 
          ei.product_variation_id AS variation_id,
@@ -496,8 +473,7 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       const price = Number(it.unit_price) || 0;
       const line = price * qty;
 
-      if (it.taxable) taxableSubtotal += line;
-      else nonTaxableSubtotal += line;
+      (it.taxable ? (taxableSubtotal += line) : (nonTaxableSubtotal += line));
 
       await client.query(
         `INSERT INTO invoice_items
@@ -512,8 +488,7 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       const price = Number(it.price) || 0;
       const line = price * qty;
 
-      if (it.taxable) taxableSubtotal += line;
-      else nonTaxableSubtotal += line;
+      (it.taxable ? (taxableSubtotal += line) : (nonTaxableSubtotal += line));
 
       await client.query(
         `INSERT INTO custom_invoice_items
@@ -549,7 +524,7 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       userId,
     ]);
 
-    // Clean up estimate
+    // Remove estimate
     await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
     await client.query(`DELETE FROM custom_estimate_items WHERE estimate_id = $1`, [estimateId]);
     await client.query(`DELETE FROM estimates WHERE id = $1 AND user_id = $2`, [estimateId, userId]);

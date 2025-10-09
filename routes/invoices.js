@@ -1,6 +1,8 @@
+// backend/routes/invoices.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
+// If you mount authenticate/subscription in index.js, you don't need router.use(authenticate) here.
 
 const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
 const toString = (v) => (v == null ? '' : String(v));
@@ -14,8 +16,7 @@ const toBool = (v, def = true) => {
 
 /**
  * POST /api/invoices
- * - Inserts each built-in selection as its own row (no dedup).
- * - Allows display_name override to persist.
+ * Inserts one row per selection (no dedup), allows display_name override.
  */
 router.post('/', async (req, res) => {
   const {
@@ -55,6 +56,7 @@ router.post('/', async (req, res) => {
     let taxableSubtotal = 0;
     let nonTaxableSubtotal = 0;
 
+    // Built-in lines (already priced by client or previous conversion)
     for (const it of (Array.isArray(variationItems) ? variationItems : [])) {
       const variationId = Number(it.variation_id ?? it.variationId);
       if (!Number.isFinite(variationId)) continue;
@@ -65,8 +67,7 @@ router.post('/', async (req, res) => {
       const displayName = toString(it.display_name || it.product_name || '').trim() || null;
 
       const line = price * qty;
-      if (taxable) taxableSubtotal += line;
-      else nonTaxableSubtotal += line;
+      (taxable ? (taxableSubtotal += line) : (nonTaxableSubtotal += line));
 
       await client.query(
         `INSERT INTO invoice_items
@@ -76,14 +77,14 @@ router.post('/', async (req, res) => {
       );
     }
 
+    // Custom lines
     for (const it of (Array.isArray(customItems) ? customItems : [])) {
       const qty = Math.max(1, parseInt(it.quantity, 10) || 1);
       const price = Number(it.price) || 0;
       const taxable = toBool(it.taxable, true);
       const line = price * qty;
 
-      if (taxable) taxableSubtotal += line;
-      else nonTaxableSubtotal += line;
+      (taxable ? (taxableSubtotal += line) : (nonTaxableSubtotal += line));
 
       await client.query(
         `INSERT INTO custom_invoice_items
@@ -101,12 +102,14 @@ router.post('/', async (req, res) => {
       );
     }
 
+    // Tax rate
     const { rows: rateRows } = await client.query(
       `SELECT COALESCE(tax_rate, 0.06) AS tax_rate FROM store_info WHERE user_id = $1`,
       [userId]
     );
     const taxRate = Number(rateRows[0]?.tax_rate ?? 0.06);
 
+    // Final total (respect discount rules)
     let finalTotal;
     if (discType === 'amount') {
       const baseGrand = taxableSubtotal * (1 + taxRate) + nonTaxableSubtotal;
@@ -125,6 +128,7 @@ router.post('/', async (req, res) => {
       userId,
     ]);
 
+    // If created from an estimate, delete that estimate atomically
     if (Number.isFinite(srcEstId)) {
       const { rowCount: own } = await client.query(
         `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
@@ -149,8 +153,7 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * GET /api/invoices
- * (no grouping, returns headers only here)
+ * GET /api/invoices — headers only
  */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
@@ -222,9 +225,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-/**
- * GET /api/invoices/:id  — header
- */
+/** GET /api/invoices/:id — header */
 router.get('/:id', async (req, res) => {
   const invoiceId = req.params.id;
   const userId = req.user.id;
@@ -244,7 +245,6 @@ router.get('/:id', async (req, res) => {
       `,
       [invoiceId, userId]
     );
-
     if (result.rowCount === 0) return res.status(404).json({ error: 'Invoice not found' });
     res.json(result.rows[0]);
   } catch (err) {
@@ -253,9 +253,7 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-/**
- * GET /api/invoices/:id/items  — NO DEDUP, includes line_id
- */
+/** GET /api/invoices/:id/items — NO DEDUP, includes line_id */
 router.get('/:id/items', async (req, res) => {
   const invoiceId = req.params.id;
   const userId = req.user.id;
@@ -329,9 +327,7 @@ router.get('/:id/items', async (req, res) => {
   }
 });
 
-/**
- * DELETE /api/invoices/:id
- */
+/** DELETE /api/invoices/:id */
 router.delete('/:id', async (req, res) => {
   const invoiceId = req.params.id;
   const userId = req.user.id;
