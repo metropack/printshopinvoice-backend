@@ -297,24 +297,26 @@ router.get('/:id/items', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { rows: variationItems } = await pool.query(
-      `
-      SELECT
-        ei.product_variation_id        AS variation_id,
-        pv.size,
-        COALESCE(ei.unit_price, pv.price)::numeric(12,2) AS price,
-        ei.quantity,
-        COALESCE(ei.taxable, TRUE)     AS taxable,
-        pv.accessory,
-        COALESCE(ei.display_name, p.name) AS product_name
-      FROM estimate_items ei
-      JOIN product_variations pv ON pv.id = ei.product_variation_id
-      JOIN products p           ON p.id  = pv.product_id
-      WHERE ei.estimate_id = $1
-      ORDER BY ei.id ASC
-      `,
-      [estimateId]
-    );
+    // Built-in (variation) lines with overrides — tolerant to missing PV/product rows
+const { rows: variationItems } = await pool.query(
+  `
+  SELECT
+    ei.product_variation_id                             AS variation_id,
+    COALESCE(pv.size, '')                               AS size,
+    COALESCE(ei.unit_price, pv.price, 0)::numeric(12,2) AS price,
+    ei.quantity,
+    COALESCE(ei.taxable, TRUE)                          AS taxable,
+    COALESCE(pv.accessory, '')                          AS accessory,
+    COALESCE(ei.display_name, p.name, 'Item')           AS product_name
+  FROM estimate_items ei
+  LEFT JOIN product_variations pv ON pv.id = ei.product_variation_id
+  LEFT JOIN products p            ON p.id = pv.product_id
+  WHERE ei.estimate_id = $1
+  ORDER BY ei.id ASC
+  `,
+  [estimateId]
+);
+
 
     const { rows: customItems } = await pool.query(
       `

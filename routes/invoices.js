@@ -268,22 +268,25 @@ router.get('/:id/items', async (req, res) => {
     }
 
     const { rows: variationItems } = await pool.query(
-      `SELECT
-         ii.id AS line_id,
-         ii.product_variation_id AS variation_id,
-         COALESCE(ii.display_name, p.name) AS product_name,
-         pv.size,
-         ii.price,
-         ii.quantity,
-         ii.taxable,
-         pv.accessory
-       FROM invoice_items ii
-       JOIN product_variations pv ON ii.product_variation_id = pv.id
-       JOIN products p ON pv.product_id = p.id
-       WHERE ii.invoice_id = $1
-       ORDER BY ii.id ASC`,
-      [invoiceId]
-    );
+  `
+  SELECT
+    ii.id AS line_id,
+    ii.product_variation_id                              AS variation_id,
+    COALESCE(ii.display_name, p.name, 'Item')            AS product_name,
+    COALESCE(pv.size, '')                                 AS size,
+    COALESCE(ii.price, pv.price, 0)::numeric(12,2)        AS price,
+    ii.quantity,
+    COALESCE(ii.taxable, TRUE)                            AS taxable,
+    COALESCE(pv.accessory, '')                            AS accessory
+  FROM invoice_items ii
+  LEFT JOIN product_variations pv ON ii.product_variation_id = pv.id
+  LEFT JOIN products p            ON pv.product_id = p.id
+  WHERE ii.invoice_id = $1
+  ORDER BY ii.id ASC
+  `,
+  [invoiceId]
+);
+
 
     const { rows: customItems } = await pool.query(
       `SELECT
