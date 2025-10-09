@@ -1,4 +1,3 @@
-// backend/routes/estimates.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
@@ -15,7 +14,6 @@ const boolish = (v, def = true) => {
   return def;
 };
 
-// Small helper to expose DB error details in dev
 function sendDbError(res, err, label) {
   console.error(`❌ ${label}:`, err);
   return res.status(500).json({
@@ -27,10 +25,7 @@ function sendDbError(res, err, label) {
   });
 }
 
-/**
- * GET /api/estimates - Fetch list of estimates (only mine)
- * Returns notes as well (max 150 chars stored).
- */
+/** GET /api/estimates */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
   try {
@@ -52,19 +47,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-/**
- * POST /api/estimates - Create a new estimate (only mine)
- * Supports overrides for built-in items:
- *   variationItems[]: {
- *     variation_id: number (required),
- *     quantity: number,
- *     // optional overrides captured per line:
- *     display_name?: string   (edited description)
- *     unit_price?: number     (edited price for this estimate line)
- *     taxable?: boolean       (override taxable on this line)
- *   }
- * customItems respected as-is.
- */
+/** POST /api/estimates — supports per-line overrides for built-ins */
 router.post('/', async (req, res) => {
   const userId = req.user.id;
   const {
@@ -84,7 +67,6 @@ router.post('/', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Insert header (total 0 for now)
     const { rows: header } = await client.query(
       `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes)
        VALUES ($1, $2, $3, NOW(), 0, $4)
@@ -96,24 +78,21 @@ router.post('/', async (req, res) => {
     let taxableSubtotal = 0;
     let nonTaxableSubtotal = 0;
 
-    // --- Built-in items with per-line overrides
-    // For each variation line we choose the effective unit price and taxable flag:
-    // - If a line override is provided (unit_price/taxable), we use it.
-    // - Otherwise we fall back to the canonical product_variations.price and taxable = true.
+    // Built-in items with overrides (NO pv.accessory here)
     for (const raw of variationItems) {
       if (!raw || !raw.variation_id) continue;
 
       const qty = Number(raw.quantity || 1);
 
-      // Get canonical price as fallback
+      // Get canonical price + product name as fallback
       const { rows: pvRows } = await client.query(
-        `SELECT price, size, accessory, p.name AS product_name
+        `SELECT pv.price, p.name AS product_name, pv.size
            FROM product_variations pv
            JOIN products p ON p.id = pv.product_id
           WHERE pv.id = $1`,
         [raw.variation_id]
       );
-      const canonical = pvRows[0] || { price: 0, product_name: '' };
+      const canonical = pvRows[0] || { price: 0, product_name: '', size: null };
 
       const effectiveUnit = Number.isFinite(+raw.unit_price) ? +raw.unit_price : Number(canonical.price || 0);
       const effectiveTaxable = boolish(raw.taxable, true);
@@ -131,7 +110,7 @@ router.post('/', async (req, res) => {
       );
     }
 
-    // --- Custom items (respect given values)
+    // Custom items (keep accessory)
     for (const item of customItems) {
       const qty = Number(item.quantity || 1);
       const price = Number(item.price || 0);
@@ -156,7 +135,7 @@ router.post('/', async (req, res) => {
       );
     }
 
-    // Compute total with user's tax rate
+    // Tax and total
     const { rows: rateRows } = await client.query(
       `SELECT COALESCE(tax_rate, 0.06) AS tax_rate
          FROM store_info
@@ -181,10 +160,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-/**
- * PUT /api/estimates/:id - Update an existing estimate in place
- * Replaces children and recomputes totals. Supports the same overrides.
- */
+/** PUT /api/estimates/:id — replace children (built-ins support overrides) */
 router.put('/:id', async (req, res) => {
   const userId = req.user.id;
   const estimateId = parseInt(req.params.id, 10);
@@ -203,7 +179,6 @@ router.put('/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Ownership check
     const { rowCount } = await client.query(
       `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
       [estimateId, userId]
@@ -213,7 +188,6 @@ router.put('/:id', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    // Update header (bubble to top), include notes
     await client.query(
       `UPDATE estimates
           SET customer_info = $1,
@@ -223,27 +197,25 @@ router.put('/:id', async (req, res) => {
       [customer_info || {}, cleanNotes, estimateId, userId]
     );
 
-    // Replace children
     await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
     await client.query(`DELETE FROM custom_estimate_items WHERE estimate_id = $1`, [estimateId]);
 
     let taxableSubtotal = 0;
     let nonTaxableSubtotal = 0;
 
-    // Variation items with overrides
     for (const raw of variationItems) {
       if (!raw || !raw.variation_id) continue;
 
       const qty = Number(raw.quantity || 1);
 
       const { rows: pvRows } = await client.query(
-        `SELECT price, p.name AS product_name
+        `SELECT pv.price, p.name AS product_name, pv.size
            FROM product_variations pv
            JOIN products p ON p.id = pv.product_id
           WHERE pv.id = $1`,
         [raw.variation_id]
       );
-      const canonical = pvRows[0] || { price: 0, product_name: '' };
+      const canonical = pvRows[0] || { price: 0, product_name: '', size: null };
 
       const effectiveUnit = Number.isFinite(+raw.unit_price) ? +raw.unit_price : Number(canonical.price || 0);
       const effectiveTaxable = boolish(raw.taxable, true);
@@ -261,7 +233,6 @@ router.put('/:id', async (req, res) => {
       );
     }
 
-    // Custom items
     for (const it of customItems) {
       const qty = Number(it.quantity || 1);
       const price = Number(it.price || 0);
@@ -279,7 +250,6 @@ router.put('/:id', async (req, res) => {
       );
     }
 
-    // Recompute with tax
     const { rows: rateRows } = await client.query(
       `SELECT COALESCE(tax_rate, 0.06) AS tax_rate
          FROM store_info
@@ -304,9 +274,7 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-/**
- * PATCH /api/estimates/:id/notes - Update notes only (max 150 chars)
- */
+/** PATCH /api/estimates/:id/notes */
 router.patch('/:id/notes', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -336,10 +304,7 @@ router.patch('/:id/notes', async (req, res) => {
   }
 });
 
-/**
- * GET /api/estimates/:id/items - Load estimate items (only mine)
- * Prefer per-line overrides; fall back to canonical values.
- */
+/** GET /api/estimates/:id/items — prefer overrides; no pv.accessory */
 router.get('/:id/items', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -360,7 +325,6 @@ router.get('/:id/items', async (req, res) => {
          COALESCE(ei.display_name, p.name) AS product_name,
          COALESCE(ei.taxable, TRUE) AS taxable,
          pv.size,
-         pv.accessory,
          ei.quantity
        FROM estimate_items ei
        JOIN product_variations pv ON pv.id = ei.product_variation_id
@@ -383,9 +347,9 @@ router.get('/:id/items', async (req, res) => {
         size: v.size,
         price: Number(v.price),
         quantity: v.quantity,
-        accessory: v.accessory,
+        accessory: null, // not available for variations anymore
         taxable: !!v.taxable,
-        variation_id: v.variation_id,
+        variation_id: v.variation_id
       })),
       ...customItems.map(c => ({
         type: 'custom',
@@ -395,8 +359,8 @@ router.get('/:id/items', async (req, res) => {
         quantity: c.quantity,
         accessory: c.accessory,
         taxable: !!c.taxable,
-        variation_id: null,
-      })),
+        variation_id: null
+      }))
     ];
 
     res.json(combinedItems);
@@ -405,9 +369,7 @@ router.get('/:id/items', async (req, res) => {
   }
 });
 
-/**
- * DELETE /api/estimates/:id - Delete an estimate (only mine)
- */
+/** DELETE /api/estimates/:id */
 router.delete('/:id', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -443,9 +405,7 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-/**
- * GET /api/estimates/search/customers - autocomplete (only mine)
- */
+/** GET /api/estimates/search/customers */
 router.get('/search/customers', async (req, res) => {
   const search = req.query.q || '';
   const userId = req.user.id;
@@ -465,10 +425,7 @@ router.get('/search/customers', async (req, res) => {
   }
 });
 
-/**
- * POST /api/estimates/:id/convert-to-invoice (atomic)
- * Carries per-line overrides (display_name, unit_price, taxable) to invoice_items.
- */
+/** POST /api/estimates/:id/convert-to-invoice — carries overrides; no pv.accessory */
 router.post('/:id/convert-to-invoice', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -487,7 +444,6 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Ownership + header
     const { rows: estRows } = await client.query(
       `SELECT id, customer_info, notes
          FROM estimates
@@ -501,7 +457,6 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
     const carriedNotes = toString(estRows[0].notes || '');
     const invNotes = toString(req.body?.notes ?? carriedNotes).slice(0, 2000);
 
-    // Create invoice
     const { rows: invHdr } = await client.query(
       `INSERT INTO invoices (user_id, customer_info, invoice_date, total,
                              discount_type, discount_value, notes)
@@ -514,7 +469,6 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
     );
     const invoiceId = invHdr[0].id;
 
-    // Built-in lines with overrides → invoice_items
     let total = 0;
     let taxableSubtotal = 0;
 
@@ -547,7 +501,6 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       );
     }
 
-    // Custom lines → custom_invoice_items (as-is)
     const { rows: customLines } = await client.query(
       `SELECT product_name, size, price, quantity, accessory,
               (CASE WHEN taxable IN (TRUE, 'true', 1) THEN TRUE ELSE FALSE END) AS taxable
@@ -571,7 +524,6 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       );
     }
 
-    // Compute final invoice total with discount
     const { rows: rateRows } = await client.query(
       `SELECT COALESCE(tax_rate, 0.06) AS tax_rate
          FROM store_info
@@ -602,7 +554,6 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       [finalTotal, invoiceId, userId]
     );
 
-    // Clean up estimate
     await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
     await client.query(`DELETE FROM custom_estimate_items WHERE estimate_id = $1`, [estimateId]);
     await client.query(`DELETE FROM estimates WHERE id = $1 AND user_id = $2`, [estimateId, userId]);

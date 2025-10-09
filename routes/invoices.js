@@ -1,4 +1,3 @@
-// backend/routes/invoices.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
@@ -23,12 +22,7 @@ function sendDbError(res, err, label) {
   });
 }
 
-/**
- * POST /api/invoices
- * Creates a new invoice for the authenticated user.
- * Accepts variationItems with per-line overrides: { variation_id, quantity, price, taxable, display_name }
- * Accepts customItems as-is.
- */
+/** POST /api/invoices */
 router.post('/', async (req, res) => {
   const {
     customer_id,
@@ -68,7 +62,6 @@ router.post('/', async (req, res) => {
       safeCustomerInfo.id = customer_id;
     }
 
-    // Header
     const { rows: hdrRows } = await client.query(
       `INSERT INTO invoices (user_id, customer_info, invoice_date, total, discount_type, discount_value, notes)
        VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), $3, $4, $5, $6)
@@ -80,7 +73,7 @@ router.post('/', async (req, res) => {
     let total = 0;
     let taxableTotal = 0;
 
-    // Variation items (use given price/taxable/display_name when provided)
+    // Built-ins (use provided overrides; no pv.accessory anywhere)
     for (const item of (variationItems || [])) {
       const qty = Number(item.quantity || 1);
       const price = Number(item.price || 0);
@@ -124,7 +117,6 @@ router.post('/', async (req, res) => {
       );
     }
 
-    // Tax rate
     const { rows: rateRows } = await client.query(
       `SELECT COALESCE(tax_rate, 0.06) AS tax_rate
          FROM store_info
@@ -133,7 +125,6 @@ router.post('/', async (req, res) => {
     );
     const taxRate = Number(rateRows[0]?.tax_rate ?? 0.06);
 
-    // Totals with discount
     const nonTaxableTotal = total - taxableTotal;
     let finalTotal;
 
@@ -156,7 +147,6 @@ router.post('/', async (req, res) => {
       [finalTotal, invoiceId, userId]
     );
 
-    // If converting, delete estimate (atomic)
     if (Number.isFinite(srcEstId)) {
       const { rowCount: own } = await client.query(
         `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
@@ -179,9 +169,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-/**
- * GET /api/invoices
- */
+/** GET /api/invoices */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
   const search = req.query.q ? `%${req.query.q}%` : null;
@@ -272,9 +260,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-/**
- * GET /api/invoices/:id
- */
+/** GET /api/invoices/:id */
 router.get('/:id', async (req, res) => {
   const invoiceId = req.params.id;
   const userId = req.user.id;
@@ -304,10 +290,7 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-/**
- * GET /api/invoices/:id/items
- * Prefer display_name for built-ins if present.
- */
+/** GET /api/invoices/:id/items — prefer display_name; no pv.accessory */
 router.get('/:id/items', async (req, res) => {
   const invoiceId = req.params.id;
   const userId = req.user.id;
@@ -328,8 +311,7 @@ router.get('/:id/items', async (req, res) => {
          ii.price,
          ii.quantity,
          ii.taxable,
-         COALESCE(ii.display_name, p.name) AS product_name,
-         pv.accessory
+         COALESCE(ii.display_name, p.name) AS product_name
        FROM invoice_items ii
        JOIN product_variations pv ON ii.product_variation_id = pv.id
        JOIN products p ON pv.product_id = p.id
@@ -351,7 +333,7 @@ router.get('/:id/items', async (req, res) => {
         size: v.size,
         price: Number(v.price),
         quantity: v.quantity,
-        accessory: v.accessory,
+        accessory: null,
         taxable: !!v.taxable,
         variation_id: v.variation_id,
       })),
@@ -373,9 +355,7 @@ router.get('/:id/items', async (req, res) => {
   }
 });
 
-/**
- * DELETE /api/invoices/:id
- */
+/** DELETE /api/invoices/:id */
 router.delete('/:id', async (req, res) => {
   const invoiceId = req.params.id;
   const userId = req.user.id;
