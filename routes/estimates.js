@@ -1,3 +1,4 @@
+// backend/routes/estimates.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
@@ -5,27 +6,40 @@ const authenticate = require('../middleware/authenticate');
 
 router.use(authenticate);
 
+// ----------------- helpers -----------------
 const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
 const toString = (v) => (v == null ? '' : String(v));
-const boolish = (v, def = true) => {
-  if (typeof v === 'boolean') return v;
-  if (v === 0 || v === '0' || v === 'false' || v === false) return false;
-  if (v === 1 || v === '1' || v === 'true' || v === true) return true;
-  return def;
-};
 
 function sendDbError(res, err, label) {
-  console.error(`❌ ${label}:`, err);
+  console.error(`❌ ${label}:`, err && err.stack ? err.stack : err);
   return res.status(500).json({
     error: 'Internal server error',
     where: label,
     message: err?.message || String(err),
     detail: err?.detail || undefined,
     code: err?.code || undefined,
+    stack: err?.stack || undefined, // TEMP: keep while debugging
   });
 }
 
-/** GET /api/estimates */
+// TEMP: verify remote schema has the new columns
+router.get('/__diag/schema', async (_req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'estimate_items'
+      ORDER BY column_name
+    `);
+    res.json({ table: 'estimate_items', columns: rows.map(r => r.column_name) });
+  } catch (err) {
+    return sendDbError(res, err, 'Schema check failed');
+  }
+});
+
+/**
+ * GET /api/estimates - list my estimates
+ */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
   try {
@@ -47,16 +61,17 @@ router.get('/', async (req, res) => {
   }
 });
 
-/** POST /api/estimates — supports per-line overrides for built-ins */
+/**
+ * POST /api/estimates - create
+ * Supports built-in line overrides:
+ *  - variationItems[*]: { variation_id, quantity, price?, taxable?, product_name? }
+ *    (price -> unit_price override; product_name -> display_name)
+ *  - customItems unchanged
+ */
 router.post('/', async (req, res) => {
+  console.log('📥 /api/estimates body:', JSON.stringify(req.body));
   const userId = req.user.id;
-  const {
-    customer_id,
-    customer_info,
-    variationItems = [],
-    customItems = [],
-    notes,
-  } = req.body || {};
+  const { customer_id, customer_info, variationItems = [], customItems = [], notes } = req.body || {};
 
   let cleanNotes = toString(notes).trim();
   if (cleanNotes.length > 150) {
@@ -67,57 +82,62 @@ router.post('/', async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const { rows: header } = await client.query(
+    // header
+    const { rows: hdr } = await client.query(
       `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes)
        VALUES ($1, $2, $3, NOW(), 0, $4)
        RETURNING id`,
       [userId, customer_id ?? null, customer_info || {}, cleanNotes]
     );
-    const estimateId = header[0].id;
+    const estimateId = hdr[0].id;
 
-    let taxableSubtotal = 0;
-    let nonTaxableSubtotal = 0;
+    let totalTaxable = 0;
+    let totalNonTaxable = 0;
 
-    // Built-in items with overrides (NO pv.accessory here)
+    // --- built-in items with per-line overrides ---
     for (const raw of variationItems) {
-      if (!raw || !raw.variation_id) continue;
+      const variationId = Number(raw.variation_id);
+      const qty = Math.max(1, Number(raw.quantity || 1));
 
-      const qty = Number(raw.quantity || 1);
-
-      // Get canonical price + product name as fallback
+      // fetch catalog price as fallback
       const { rows: pvRows } = await client.query(
-        `SELECT pv.price, p.name AS product_name, pv.size
+        `SELECT pv.price, pv.size, pv.accessory, p.name AS product_name
            FROM product_variations pv
            JOIN products p ON p.id = pv.product_id
           WHERE pv.id = $1`,
-        [raw.variation_id]
+        [variationId]
       );
-      const canonical = pvRows[0] || { price: 0, product_name: '', size: null };
+      const pv = pvRows[0] || {};
+      const catalogPrice = Number(pv.price || 0);
 
-      const effectiveUnit = Number.isFinite(+raw.unit_price) ? +raw.unit_price : Number(canonical.price || 0);
-      const effectiveTaxable = boolish(raw.taxable, true);
-      const effectiveName = toString(raw.display_name || raw.product_name || canonical.product_name || '');
+      const unitPrice = Number(
+        raw.unit_price ?? raw.price ?? catalogPrice
+      );
+      const taxable = raw.taxable !== undefined ? !!raw.taxable : true;
+      const displayName = toString(raw.display_name ?? raw.product_name ?? pv.product_name);
 
-      const line = effectiveUnit * qty;
-      if (effectiveTaxable) taxableSubtotal += line;
-      else nonTaxableSubtotal += line;
+      // compute totals using overrides
+      const line = unitPrice * qty;
+      if (taxable) totalTaxable += line;
+      else totalNonTaxable += line;
 
+      // persist with overrides
       await client.query(
         `INSERT INTO estimate_items
            (estimate_id, product_variation_id, quantity, unit_price, taxable, display_name)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [estimateId, raw.variation_id, qty, effectiveUnit, effectiveTaxable, effectiveName]
+        [estimateId, variationId, qty, unitPrice, taxable, displayName || null]
       );
     }
 
-    // Custom items (keep accessory)
-    for (const item of customItems) {
-      const qty = Number(item.quantity || 1);
-      const price = Number(item.price || 0);
-      const taxable = boolish(item.taxable, true);
+    // --- custom items (unchanged) ---
+    for (const raw of customItems) {
+      const qty = Math.max(1, Number(raw.quantity || 1));
+      const price = Number(raw.price || 0);
+      const taxable = raw.taxable === true || raw.taxable === 'true' || raw.taxable === 1;
       const line = price * qty;
-      if (taxable) taxableSubtotal += line;
-      else nonTaxableSubtotal += line;
+      if (taxable) totalTaxable += line;
+      else totalNonTaxable += line;
 
       await client.query(
         `INSERT INTO custom_estimate_items 
@@ -125,17 +145,17 @@ router.post('/', async (req, res) => {
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
           estimateId,
-          toString(item.product_name),
-          toString(item.size),
+          toString(raw.product_name),
+          toString(raw.size),
           price,
           qty,
-          toString(item.accessory),
-          taxable,
+          toString(raw.accessory),
+          taxable
         ]
       );
     }
 
-    // Tax and total
+    // tax rate
     const { rows: rateRows } = await client.query(
       `SELECT COALESCE(tax_rate, 0.06) AS tax_rate
          FROM store_info
@@ -143,7 +163,7 @@ router.post('/', async (req, res) => {
       [userId]
     );
     const taxRate = Number(rateRows[0]?.tax_rate ?? 0.06);
-    const finalTotal = taxableSubtotal * (1 + taxRate) + nonTaxableSubtotal;
+    const finalTotal = totalTaxable * (1 + taxRate) + totalNonTaxable;
 
     await client.query(
       `UPDATE estimates SET total = $1 WHERE id = $2 AND user_id = $3`,
@@ -160,7 +180,10 @@ router.post('/', async (req, res) => {
   }
 });
 
-/** PUT /api/estimates/:id — replace children (built-ins support overrides) */
+/**
+ * PUT /api/estimates/:id - update (replace items)
+ * Same override semantics as POST.
+ */
 router.put('/:id', async (req, res) => {
   const userId = req.user.id;
   const estimateId = parseInt(req.params.id, 10);
@@ -179,6 +202,7 @@ router.put('/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // ownership
     const { rowCount } = await client.query(
       `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
       [estimateId, userId]
@@ -188,59 +212,61 @@ router.put('/:id', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
+    // header
     await client.query(
       `UPDATE estimates
-          SET customer_info = $1,
-              estimate_date = NOW(),
-              notes = $2
-        WHERE id = $3 AND user_id = $4`,
+         SET customer_info = $1,
+             estimate_date = NOW(),
+             notes = $2
+       WHERE id = $3 AND user_id = $4`,
       [customer_info || {}, cleanNotes, estimateId, userId]
     );
 
+    // replace children
     await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
     await client.query(`DELETE FROM custom_estimate_items WHERE estimate_id = $1`, [estimateId]);
 
-    let taxableSubtotal = 0;
-    let nonTaxableSubtotal = 0;
+    let totalTaxable = 0;
+    let totalNonTaxable = 0;
 
     for (const raw of variationItems) {
-      if (!raw || !raw.variation_id) continue;
-
-      const qty = Number(raw.quantity || 1);
+      const variationId = Number(raw.variation_id);
+      const qty = Math.max(1, Number(raw.quantity || 1));
 
       const { rows: pvRows } = await client.query(
-        `SELECT pv.price, p.name AS product_name, pv.size
+        `SELECT pv.price, p.name AS product_name
            FROM product_variations pv
            JOIN products p ON p.id = pv.product_id
           WHERE pv.id = $1`,
-        [raw.variation_id]
+        [variationId]
       );
-      const canonical = pvRows[0] || { price: 0, product_name: '', size: null };
+      const pv = pvRows[0] || {};
+      const catalogPrice = Number(pv.price || 0);
 
-      const effectiveUnit = Number.isFinite(+raw.unit_price) ? +raw.unit_price : Number(canonical.price || 0);
-      const effectiveTaxable = boolish(raw.taxable, true);
-      const effectiveName = toString(raw.display_name || raw.product_name || canonical.product_name || '');
+      const unitPrice = Number(raw.unit_price ?? raw.price ?? catalogPrice);
+      const taxable = raw.taxable !== undefined ? !!raw.taxable : true;
+      const displayName = toString(raw.display_name ?? raw.product_name ?? pv.product_name);
 
-      const line = effectiveUnit * qty;
-      if (effectiveTaxable) taxableSubtotal += line;
-      else nonTaxableSubtotal += line;
+      const line = unitPrice * qty;
+      if (taxable) totalTaxable += line;
+      else totalNonTaxable += line;
 
       await client.query(
         `INSERT INTO estimate_items
            (estimate_id, product_variation_id, quantity, unit_price, taxable, display_name)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [estimateId, raw.variation_id, qty, effectiveUnit, effectiveTaxable, effectiveName]
+        [estimateId, variationId, qty, unitPrice, taxable, displayName || null]
       );
     }
 
     for (const it of customItems) {
-      const qty = Number(it.quantity || 1);
+      const qty = Math.max(1, Number(it.quantity || 1));
       const price = Number(it.price || 0);
-      const taxable = boolish(it.taxable, true);
-      const line = price * qty;
+      const taxable = it.taxable === true || it.taxable === 'true' || it.taxable === 1;
 
-      if (taxable) taxableSubtotal += line;
-      else nonTaxableSubtotal += line;
+      const line = price * qty;
+      if (taxable) totalTaxable += line;
+      else totalNonTaxable += line;
 
       await client.query(
         `INSERT INTO custom_estimate_items
@@ -257,7 +283,7 @@ router.put('/:id', async (req, res) => {
       [userId]
     );
     const taxRate = Number(rateRows[0]?.tax_rate ?? 0.06);
-    const finalTotal = taxableSubtotal * (1 + taxRate) + nonTaxableSubtotal;
+    const finalTotal = totalTaxable * (1 + taxRate) + totalNonTaxable;
 
     await client.query(
       `UPDATE estimates SET total = $1 WHERE id = $2 AND user_id = $3`,
@@ -274,7 +300,9 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-/** PATCH /api/estimates/:id/notes */
+/**
+ * PATCH /api/estimates/:id/notes
+ */
 router.patch('/:id/notes', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -289,22 +317,21 @@ router.patch('/:id/notes', async (req, res) => {
       `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
       [estimateId, userId]
     );
-    if (check.rowCount === 0) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+    if (check.rowCount === 0) return res.status(403).json({ error: 'Access denied' });
 
     await pool.query(
       `UPDATE estimates SET notes = $1 WHERE id = $2 AND user_id = $3`,
       [cleanNotes, estimateId, userId]
     );
-
     res.json({ message: 'Notes updated' });
   } catch (err) {
     return sendDbError(res, err, 'Error updating estimate notes');
   }
 });
 
-/** GET /api/estimates/:id/items — prefer overrides; no pv.accessory */
+/**
+ * GET /api/estimates/:id/items - load with overrides
+ */
 router.get('/:id/items', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -320,23 +347,26 @@ router.get('/:id/items', async (req, res) => {
 
     const { rows: variationItems } = await pool.query(
       `SELECT 
-         ei.product_variation_id AS variation_id,
+         pv.id as variation_id,
+         pv.size,
+         pv.accessory,
          COALESCE(ei.unit_price, pv.price) AS price,
          COALESCE(ei.display_name, p.name) AS product_name,
          COALESCE(ei.taxable, TRUE) AS taxable,
-         pv.size,
          ei.quantity
        FROM estimate_items ei
-       JOIN product_variations pv ON pv.id = ei.product_variation_id
+       JOIN product_variations pv ON ei.product_variation_id = pv.id
        JOIN products p ON pv.product_id = p.id
-      WHERE ei.estimate_id = $1`,
+       WHERE ei.estimate_id = $1
+       ORDER BY ei.id ASC`,
       [estimateId]
     );
 
     const { rows: customItems } = await pool.query(
       `SELECT product_name, size, price, quantity, accessory, taxable
          FROM custom_estimate_items
-        WHERE estimate_id = $1`,
+        WHERE estimate_id = $1
+        ORDER BY id ASC`,
       [estimateId]
     );
 
@@ -347,7 +377,7 @@ router.get('/:id/items', async (req, res) => {
         size: v.size,
         price: Number(v.price),
         quantity: v.quantity,
-        accessory: null, // not available for variations anymore
+        accessory: v.accessory,
         taxable: !!v.taxable,
         variation_id: v.variation_id
       })),
@@ -358,7 +388,7 @@ router.get('/:id/items', async (req, res) => {
         price: Number(c.price),
         quantity: c.quantity,
         accessory: c.accessory,
-        taxable: !!c.taxable,
+        taxable: (c.taxable === true || c.taxable === 'true' || c.taxable === 1),
         variation_id: null
       }))
     ];
@@ -369,63 +399,10 @@ router.get('/:id/items', async (req, res) => {
   }
 });
 
-/** DELETE /api/estimates/:id */
-router.delete('/:id', async (req, res) => {
-  const estimateId = req.params.id;
-  const userId = req.user.id;
-
-  if (!/^\d+$/.test(String(estimateId))) {
-    return res.status(400).json({ error: 'Invalid estimate id' });
-  }
-
-  try {
-    const check = await pool.query(
-      `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
-      [estimateId, userId]
-    );
-    if (check.rowCount === 0) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    await pool.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
-    await pool.query(`DELETE FROM custom_estimate_items WHERE estimate_id = $1`, [estimateId]);
-
-    const { rowCount } = await pool.query(
-      `DELETE FROM estimates WHERE id = $1 AND user_id = $2`,
-      [estimateId, userId]
-    );
-
-    if (!rowCount) {
-      return res.status(404).json({ error: 'Estimate not found after child deletes' });
-    }
-
-    res.json({ message: 'Estimate deleted' });
-  } catch (err) {
-    return sendDbError(res, err, 'Error deleting estimate');
-  }
-});
-
-/** GET /api/estimates/search/customers */
-router.get('/search/customers', async (req, res) => {
-  const search = req.query.q || '';
-  const userId = req.user.id;
-
-  try {
-    const result = await pool.query(
-      `SELECT DISTINCT ON (name, company) * FROM customers
-       WHERE user_id = $2
-         AND (name ILIKE $1 OR email ILIKE $1 OR phone ILIKE $1 OR company ILIKE $1)
-       ORDER BY name, company, created_at DESC
-       LIMIT 10`,
-      [`%${search}%`, userId]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    return sendDbError(res, err, 'Error searching customers');
-  }
-});
-
-/** POST /api/estimates/:id/convert-to-invoice — carries overrides; no pv.accessory */
+/**
+ * POST /api/estimates/:id/convert-to-invoice
+ * Carries display_name → invoice_items.display_name
+ */
 router.post('/:id/convert-to-invoice', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
@@ -454,73 +431,74 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Access denied' });
     }
+    const customer_info = estRows[0].customer_info || {};
     const carriedNotes = toString(estRows[0].notes || '');
     const invNotes = toString(req.body?.notes ?? carriedNotes).slice(0, 2000);
+
+    const { rows: variationItems } = await client.query(
+      `SELECT 
+         ei.product_variation_id AS variation_id,
+         ei.quantity,
+         COALESCE(ei.unit_price, pv.price) AS price,
+         COALESCE(ei.display_name, p.name) AS display_name,
+         COALESCE(ei.taxable, TRUE) AS taxable
+       FROM estimate_items ei
+       JOIN product_variations pv ON pv.id = ei.product_variation_id
+       JOIN products p ON p.id = pv.product_id
+      WHERE ei.estimate_id = $1
+      ORDER BY ei.id ASC`,
+      [estimateId]
+    );
+
+    const { rows: customItems } = await client.query(
+      `SELECT product_name, size, price, quantity, accessory,
+              (CASE WHEN taxable IN (TRUE, 'true', 1) THEN TRUE ELSE FALSE END) AS taxable
+         FROM custom_estimate_items
+        WHERE estimate_id = $1
+        ORDER BY id ASC`,
+      [estimateId]
+    );
 
     const { rows: invHdr } = await client.query(
       `INSERT INTO invoices (user_id, customer_info, invoice_date, total,
                              discount_type, discount_value, notes)
-       SELECT $1, customer_info, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), 0,
-              $2, $3, $4
-         FROM estimates
-        WHERE id = $5 AND user_id = $1
+       VALUES ($1, $2, (CURRENT_TIMESTAMP AT TIME ZONE 'America/New_York'), 0,
+               $3, $4, $5)
        RETURNING id`,
-      [userId, discType, discVal, invNotes, estimateId]
+      [userId, customer_info, discType, discVal, invNotes]
     );
     const invoiceId = invHdr[0].id;
 
     let total = 0;
-    let taxableSubtotal = 0;
+    let taxableTotal = 0;
 
-    const { rows: varLines } = await client.query(
-      `SELECT 
-         ei.product_variation_id AS variation_id,
-         COALESCE(ei.unit_price, pv.price) AS price,
-         COALESCE(ei.display_name, p.name) AS product_name,
-         COALESCE(ei.taxable, TRUE) AS taxable,
-         ei.quantity
-       FROM estimate_items ei
-       JOIN product_variations pv ON pv.id = ei.product_variation_id
-       JOIN products p ON p.id = pv.product_id
-      WHERE ei.estimate_id = $1`,
-      [estimateId]
-    );
-
-    for (const line of varLines) {
-      const qty = Number(line.quantity || 1);
-      const price = Number(line.price || 0);
-      const amt = price * qty;
-      total += amt;
-      if (line.taxable) taxableSubtotal += amt;
+    for (const it of variationItems) {
+      const qty = Number(it.quantity || 1);
+      const price = Number(it.price || 0);
+      const line = price * qty;
+      total += line;
+      if (it.taxable) taxableTotal += line;
 
       await client.query(
         `INSERT INTO invoice_items
            (invoice_id, product_variation_id, quantity, price, taxable, display_name)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [invoiceId, line.variation_id, qty, price, !!line.taxable, toString(line.product_name)]
+        [invoiceId, it.variation_id, qty, price, !!it.taxable, toString(it.display_name) || null]
       );
     }
 
-    const { rows: customLines } = await client.query(
-      `SELECT product_name, size, price, quantity, accessory,
-              (CASE WHEN taxable IN (TRUE, 'true', 1) THEN TRUE ELSE FALSE END) AS taxable
-         FROM custom_estimate_items
-        WHERE estimate_id = $1`,
-      [estimateId]
-    );
-
-    for (const it of customLines) {
+    for (const it of customItems) {
       const qty = Number(it.quantity || 1);
       const price = Number(it.price || 0);
-      const amt = price * qty;
-      total += amt;
-      if (it.taxable) taxableSubtotal += amt;
+      const line = price * qty;
+      total += line;
+      if (it.taxable) taxableTotal += line;
 
       await client.query(
         `INSERT INTO custom_invoice_items
            (invoice_id, product_name, size, price, quantity, accessory, taxable)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [invoiceId, toString(it.product_name), toString(it.size), price, qty, toString(it.accessory), !!it.taxable]
+        [invoiceId, it.product_name || '', it.size || '', price, qty, it.accessory || '', it.taxable]
       );
     }
 
@@ -532,25 +510,23 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
     );
     const taxRate = Number(rateRows[0]?.tax_rate ?? 0.06);
 
-    const nonTaxableSubtotal = total - taxableSubtotal;
+    const nonTaxableTotal = total - taxableTotal;
     let finalTotal;
 
     if (discType === 'amount') {
-      const baseGrand = taxableSubtotal * (1 + taxRate) + nonTaxableSubtotal;
+      const baseGrand = taxableTotal * (1 + taxRate) + nonTaxableTotal;
       const maxDisc = clamp(discVal, 0, baseGrand);
       finalTotal = Math.max(0, baseGrand - maxDisc);
     } else {
       const pct = clamp(discVal, 0, 100) / 100;
-      const taxableAfter = taxableSubtotal * (1 - pct);
-      const nonTaxAfter  = nonTaxableSubtotal * (1 - pct);
+      const taxableAfter = taxableTotal * (1 - pct);
+      const nonTaxAfter  = nonTaxableTotal * (1 - pct);
       const taxAfter     = taxableAfter * taxRate;
       finalTotal = taxableAfter + nonTaxAfter + taxAfter;
     }
 
     await client.query(
-      `UPDATE invoices
-          SET total = $1
-        WHERE id = $2 AND user_id = $3`,
+      `UPDATE invoices SET total = $1 WHERE id = $2 AND user_id = $3`,
       [finalTotal, invoiceId, userId]
     );
 

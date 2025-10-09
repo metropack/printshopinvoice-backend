@@ -1,28 +1,27 @@
+// backend/routes/invoices.js
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 
 const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
 const toString = (v) => (v == null ? '' : String(v));
-const boolish = (v, def = true) => {
-  if (typeof v === 'boolean') return v;
-  if (v === 0 || v === '0' || v === 'false' || v === false) return false;
-  if (v === 1 || v === '1' || v === 'true' || v === true) return true;
-  return def;
-};
 
 function sendDbError(res, err, label) {
-  console.error(`❌ ${label}:`, err);
+  console.error(`❌ ${label}:`, err && err.stack ? err.stack : err);
   return res.status(500).json({
     error: 'Internal server error',
     where: label,
     message: err?.message || String(err),
     detail: err?.detail || undefined,
     code: err?.code || undefined,
+    stack: err?.stack || undefined, // TEMP
   });
 }
 
-/** POST /api/invoices */
+/**
+ * POST /api/invoices
+ * Accepts built-in items with per-line overrides as well.
+ */
 router.post('/', async (req, res) => {
   const {
     customer_id,
@@ -73,32 +72,37 @@ router.post('/', async (req, res) => {
     let total = 0;
     let taxableTotal = 0;
 
-    // Built-ins (use provided overrides; no pv.accessory anywhere)
-    for (const item of (variationItems || [])) {
-      const qty = Number(item.quantity || 1);
-      const price = Number(item.price || 0);
-      const line = price * qty;
+    // built-in items (support overrides from client)
+    for (const it of (variationItems || [])) {
+      const qty = Number(it.quantity || 1);
+      const unitPrice = Number(it.price || 0);
+      const isTaxable = it.taxable !== undefined ? !!it.taxable : true;
+      const line = unitPrice * qty;
       total += line;
-
-      const isTaxable = boolish(item.taxable, true);
       if (isTaxable) taxableTotal += line;
 
       await client.query(
         `INSERT INTO invoice_items
            (invoice_id, product_variation_id, quantity, price, taxable, display_name)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [invoiceId, item.variation_id, qty, price, isTaxable, toString(item.display_name || item.product_name)]
+        [
+          invoiceId,
+          it.variation_id,
+          qty,
+          unitPrice,
+          isTaxable,
+          toString(it.product_name || it.display_name) || null
+        ]
       );
     }
 
-    // Custom items
-    for (const item of (customItems || [])) {
-      const qty = Number(item.quantity || 1);
-      const price = Number(item.price || 0);
+    // custom items
+    for (const it of (customItems || [])) {
+      const qty = Number(it.quantity || 1);
+      const price = Number(it.price || 0);
+      const isTaxable = it.taxable !== undefined ? !!it.taxable : true;
       const line = price * qty;
       total += line;
-
-      const isTaxable = boolish(item.taxable, true);
       if (isTaxable) taxableTotal += line;
 
       await client.query(
@@ -107,20 +111,18 @@ router.post('/', async (req, res) => {
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
         [
           invoiceId,
-          toString(item.product_name),
-          toString(item.size),
+          toString(it.product_name),
+          toString(it.size),
           price,
           qty,
-          toString(item.accessory),
+          toString(it.accessory),
           isTaxable,
         ]
       );
     }
 
     const { rows: rateRows } = await client.query(
-      `SELECT COALESCE(tax_rate, 0.06) AS tax_rate
-         FROM store_info
-        WHERE user_id = $1`,
+      `SELECT COALESCE(tax_rate, 0.06) AS tax_rate FROM store_info WHERE user_id = $1`,
       [userId]
     );
     const taxRate = Number(rateRows[0]?.tax_rate ?? 0.06);
@@ -141,9 +143,7 @@ router.post('/', async (req, res) => {
     }
 
     await client.query(
-      `UPDATE invoices
-          SET total = $1
-        WHERE id = $2 AND user_id = $3`,
+      `UPDATE invoices SET total = $1 WHERE id = $2 AND user_id = $3`,
       [finalTotal, invoiceId, userId]
     );
 
@@ -169,7 +169,9 @@ router.post('/', async (req, res) => {
   }
 });
 
-/** GET /api/invoices */
+/**
+ * GET /api/invoices (list)
+ */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
   const search = req.query.q ? `%${req.query.q}%` : null;
@@ -233,24 +235,32 @@ router.get('/', async (req, res) => {
       params = [userId];
     }
 
+    console.time('invoices-db');
     const invoices = await pool.query(sql, params);
+    console.timeEnd('invoices-db');
 
     const data = [];
     for (const inv of invoices.rows) {
+      console.time(`invoice-items-${inv.id}`);
       const { rows: items } = await pool.query(
         `
-        SELECT ii.quantity, ii.price, ii.taxable
+        SELECT ii.quantity, ii.price, ii.taxable,
+               COALESCE(ii.display_name, p.name) AS product_name
           FROM invoice_items ii
           JOIN invoices inv ON inv.id = ii.invoice_id
+          JOIN product_variations pv ON pv.id = ii.product_variation_id
+          JOIN products p ON p.id = pv.product_id
          WHERE ii.invoice_id = $1 AND inv.user_id = $2
         UNION ALL
-        SELECT ci.quantity, ci.price, ci.taxable
+        SELECT ci.quantity, ci.price, ci.taxable, ci.product_name
           FROM custom_invoice_items ci
           JOIN invoices inv2 ON inv2.id = ci.invoice_id
          WHERE ci.invoice_id = $1 AND inv2.user_id = $2
         `,
         [inv.id, userId]
       );
+      console.timeEnd(`invoice-items-${inv.id}`);
+
       data.push({ ...inv, items });
     }
 
@@ -260,7 +270,9 @@ router.get('/', async (req, res) => {
   }
 });
 
-/** GET /api/invoices/:id */
+/**
+ * GET /api/invoices/:id - header
+ */
 router.get('/:id', async (req, res) => {
   const invoiceId = req.params.id;
   const userId = req.user.id;
@@ -290,7 +302,9 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-/** GET /api/invoices/:id/items — prefer display_name; no pv.accessory */
+/**
+ * GET /api/invoices/:id/items
+ */
 router.get('/:id/items', async (req, res) => {
   const invoiceId = req.params.id;
   const userId = req.user.id;
@@ -301,7 +315,9 @@ router.get('/:id/items', async (req, res) => {
       [invoiceId, userId]
     );
     if (check.rowCount === 0) {
-      return res.status(403).json({ error: 'Access denied: invoice does not belong to user.' });
+      return res.status(403).json({
+        error: 'Access denied: invoice does not belong to user.',
+      });
     }
 
     const { rows: variationItems } = await pool.query(
@@ -311,18 +327,21 @@ router.get('/:id/items', async (req, res) => {
          ii.price,
          ii.quantity,
          ii.taxable,
-         COALESCE(ii.display_name, p.name) AS product_name
+         pv.accessory,
+         COALESCE(ii.display_name, p.name) as product_name
        FROM invoice_items ii
        JOIN product_variations pv ON ii.product_variation_id = pv.id
        JOIN products p ON pv.product_id = p.id
-       WHERE ii.invoice_id = $1`,
+       WHERE ii.invoice_id = $1
+       ORDER BY ii.id ASC`,
       [invoiceId]
     );
 
     const { rows: customItems } = await pool.query(
       `SELECT product_name, size, price, quantity, accessory, taxable
          FROM custom_invoice_items
-        WHERE invoice_id = $1`,
+        WHERE invoice_id = $1
+        ORDER BY id ASC`,
       [invoiceId]
     );
 
@@ -333,7 +352,7 @@ router.get('/:id/items', async (req, res) => {
         size: v.size,
         price: Number(v.price),
         quantity: v.quantity,
-        accessory: null,
+        accessory: v.accessory,
         taxable: !!v.taxable,
         variation_id: v.variation_id,
       })),
@@ -344,7 +363,7 @@ router.get('/:id/items', async (req, res) => {
         price: Number(c.price),
         quantity: c.quantity,
         accessory: c.accessory,
-        taxable: !!c.taxable,
+        taxable: (c.taxable === true || c.taxable === 'true' || c.taxable === 1),
         variation_id: null,
       })),
     ];
@@ -355,7 +374,9 @@ router.get('/:id/items', async (req, res) => {
   }
 });
 
-/** DELETE /api/invoices/:id */
+/**
+ * DELETE /api/invoices/:id
+ */
 router.delete('/:id', async (req, res) => {
   const invoiceId = req.params.id;
   const userId = req.user.id;
