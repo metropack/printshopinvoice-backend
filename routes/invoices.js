@@ -16,6 +16,11 @@ const toString = (v) => (v == null ? '' : String(v));
  * - Computes total using user's tax_rate (fallback 0.06).
  * - Persists discount_type ('amount' | 'percent') and discount_value (number).
  * - If source_estimate_id is provided (and belongs to the user), deletes that estimate + its items atomically.
+ *
+ * Built-in items update:
+ * - Accept and persist per-line `display_name` for variation items.
+ * - Keep unit `price` coming from client (already persisted on invoice_items).
+ * - Do not collapse duplicates (no GROUP/GLOBAL merge).
  */
 router.post('/', async (req, res) => {
   const {
@@ -74,7 +79,7 @@ router.post('/', async (req, res) => {
     let total = 0;         // subtotal (taxable + non-taxable)
     let taxableTotal = 0;  // taxable subtotal only
 
-    // Variation items
+    // Variation items (accept display_name + client unit price)
     for (const item of (variationItems || [])) {
       const qty = Number(item.quantity || 1);
       const price = Number(item.price || 0);
@@ -86,9 +91,16 @@ router.post('/', async (req, res) => {
 
       await client.query(
         `INSERT INTO invoice_items
-           (invoice_id, product_variation_id, quantity, price, taxable)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [invoiceId, item.variation_id, qty, price, isTaxable]
+           (invoice_id, product_variation_id, quantity, price, taxable, display_name)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          invoiceId,
+          item.variation_id,
+          qty,
+          price,
+          isTaxable,
+          item.display_name || item.product_name || null, // ← NEW: persist edited description
+        ]
       );
     }
 
@@ -322,6 +334,11 @@ router.get('/:id', async (req, res) => {
 /**
  * GET /api/invoices/:id/items
  * Returns items for a specific invoice after verifying ownership.
+ *
+ * Built-in items update:
+ * - Prefer per-line `display_name` if present, otherwise product name.
+ * - Use the unit `ii.price` saved on the row (never overwrite with catalog).
+ * - Preserve duplicates (no grouping).
  */
 router.get('/:id/items', async (req, res) => {
   const invoiceId = req.params.id;
@@ -342,12 +359,12 @@ router.get('/:id/items', async (req, res) => {
     const { rows: variationItems } = await pool.query(
       `SELECT
          ii.product_variation_id as variation_id,
+         COALESCE(ii.display_name, p.name) AS product_name,  -- prefer override
          pv.size,
-         ii.price,
+         ii.price,                                          -- unit price as saved
          ii.quantity,
          ii.taxable,
-         pv.accessory,
-         p.name as product_name
+         pv.accessory
        FROM invoice_items ii
        JOIN product_variations pv ON ii.product_variation_id = pv.id
        JOIN products p ON pv.product_id = p.id
@@ -367,20 +384,20 @@ router.get('/:id/items', async (req, res) => {
         type: 'variation',
         product_name: v.product_name,
         size: v.size,
-        price: v.price,
-        quantity: v.quantity,
+        price: Number(v.price || 0),
+        quantity: Number(v.quantity || 1),
         accessory: v.accessory,
-        taxable: v.taxable,
+        taxable: !!v.taxable,
         variation_id: v.variation_id,
       })),
       ...customItems.map(c => ({
         type: 'custom',
         product_name: c.product_name,
         size: c.size,
-        price: c.price,
-        quantity: c.quantity,
+        price: Number(c.price || 0),
+        quantity: Number(c.quantity || 1),
         accessory: c.accessory,
-        taxable: c.taxable,
+        taxable: !!c.taxable,
         variation_id: null,
       })),
     ];

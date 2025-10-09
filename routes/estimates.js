@@ -39,10 +39,18 @@ router.get('/', async (req, res) => {
 
 /**
  * POST /api/estimates - Create a new estimate (only mine)
- * - Variation items: taxable by default
+ * - Variation items: now accept unit price + optional display_name (+ optional taxable)
  * - Custom items: respects taxable flag
  * - Total uses the user's saved store tax rate (fallback 0.06)
  * - Persists notes (REQUIRED max 150 chars, trimmed)
+ *
+ * Schema expectations (additive, backward compatible):
+ *   estimate_items:
+ *     - product_variation_id (int)      -- existing
+ *     - quantity (int)                  -- existing
+ *     - unit_price (numeric)            -- NEW (nullable, fallback to pv.price)
+ *     - taxable (boolean)               -- NEW (nullable, default true)
+ *     - display_name (text)             -- NEW (nullable)
  */
 router.post('/', async (req, res) => {
   const userId = req.user.id;
@@ -53,8 +61,11 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'Notes must be 150 characters or fewer.' });
   }
 
+  const client = await pool.connect();
   try {
-    const insertEstimate = await pool.query(
+    await client.query('BEGIN');
+
+    const insertEstimate = await client.query(
       `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes)
        VALUES ($1, $2, $3, NOW(), $4, $5)
        RETURNING id`,
@@ -65,22 +76,38 @@ router.post('/', async (req, res) => {
     let totalTaxable = 0;
     let totalNonTaxable = 0;
 
-    // Variation items (taxable = true)
+    // Variation items (accept overrides)
     for (const item of variationItems) {
-      const priceRes = await pool.query(
-        `SELECT price FROM product_variations WHERE id = $1`,
-        [item.variation_id]
-      );
-      const price = Number(priceRes.rows[0]?.price || 0);
       const qty = Number(item.quantity || 1);
+
+      // unit price: prefer client override; fallback to catalog
+      let price = Number(item.price);
+      if (!Number.isFinite(price)) {
+        const priceRes = await client.query(
+          `SELECT price FROM product_variations WHERE id = $1`,
+          [item.variation_id]
+        );
+        price = Number(priceRes.rows[0]?.price || 0);
+      }
+
+      // taxable: allow optional override; default true
+      const taxable = item.taxable !== undefined ? !!item.taxable : true;
+
       const line = price * qty;
+      if (taxable) totalTaxable += line;
+      else totalNonTaxable += line;
 
-      totalTaxable += line; // variation lines considered taxable
-
-      await pool.query(
-        `INSERT INTO estimate_items (estimate_id, product_variation_id, quantity)
-         VALUES ($1, $2, $3)`,
-        [estimateId, item.variation_id, qty]
+      await client.query(
+        `INSERT INTO estimate_items (estimate_id, product_variation_id, quantity, unit_price, taxable, display_name)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          estimateId,
+          item.variation_id,
+          qty,
+          price,
+          taxable,
+          item.display_name || item.product_name || null, // ← persist edited description
+        ]
       );
     }
 
@@ -94,7 +121,7 @@ router.post('/', async (req, res) => {
       if (taxable) totalTaxable += line;
       else totalNonTaxable += line;
 
-      await pool.query(
+      await client.query(
         `INSERT INTO custom_estimate_items 
          (estimate_id, product_name, size, price, quantity, accessory, taxable)
          VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -111,7 +138,7 @@ router.post('/', async (req, res) => {
     }
 
     // Use user's saved tax rate
-    const { rows: rateRows } = await pool.query(
+    const { rows: rateRows } = await client.query(
       `SELECT COALESCE(tax_rate, 0.06) AS tax_rate
          FROM store_info
         WHERE user_id = $1`,
@@ -121,15 +148,19 @@ router.post('/', async (req, res) => {
 
     const finalTotal = totalTaxable * (1 + taxRate) + totalNonTaxable;
 
-    await pool.query(
+    await client.query(
       `UPDATE estimates SET total = $1 WHERE id = $2 AND user_id = $3`,
       [finalTotal, estimateId, userId]
     );
 
+    await client.query('COMMIT');
     res.status(201).json({ message: 'Estimate saved', estimateId });
   } catch (err) {
+    await client.query('ROLLBACK');
     console.error("❌ Error saving estimate:", err);
     res.status(500).json({ error: 'Failed to save estimate' });
+  } finally {
+    client.release();
   }
 });
 
@@ -137,6 +168,7 @@ router.post('/', async (req, res) => {
  * PUT /api/estimates/:id - Update an existing estimate in place
  * - Replaces items, recomputes total with user's tax rate
  * - Updates notes (still max 150 chars)
+ * - Built-in items: keep `unit_price`, `display_name`, `taxable` if provided
  */
 router.put('/:id', async (req, res) => {
   const userId = req.user.id;
@@ -183,22 +215,38 @@ router.put('/:id', async (req, res) => {
     let totalTaxable = 0;
     let totalNonTaxable = 0;
 
-    // Variation items (taxable = true)
+    // Variation items (accept overrides)
     for (const item of variationItems) {
       const qty = Number(item.quantity || 1);
 
-      const priceRes = await client.query(
-        `SELECT price FROM product_variations WHERE id = $1`,
-        [item.variation_id]
-      );
-      const price = Number(priceRes.rows[0]?.price || 0);
+      // unit price: prefer client override; fallback to catalog
+      let price = Number(item.price);
+      if (!Number.isFinite(price)) {
+        const priceRes = await client.query(
+          `SELECT price FROM product_variations WHERE id = $1`,
+          [item.variation_id]
+        );
+        price = Number(priceRes.rows[0]?.price || 0);
+      }
 
-      totalTaxable += price * qty;
+      // taxable: allow optional override; default true
+      const taxable = item.taxable !== undefined ? !!item.taxable : true;
+
+      const line = price * qty;
+      if (taxable) totalTaxable += line;
+      else totalNonTaxable += line;
 
       await client.query(
-        `INSERT INTO estimate_items (estimate_id, product_variation_id, quantity)
-         VALUES ($1, $2, $3)`,
-        [estimateId, item.variation_id, qty]
+        `INSERT INTO estimate_items (estimate_id, product_variation_id, quantity, unit_price, taxable, display_name)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          estimateId,
+          item.variation_id,
+          qty,
+          price,
+          taxable,
+          item.display_name || item.product_name || null,
+        ]
       );
     }
 
@@ -280,6 +328,10 @@ router.patch('/:id/notes', async (req, res) => {
 
 /**
  * GET /api/estimates/:id/items - Load estimate items (only mine)
+ *
+ * Built-in items update:
+ * - Prefer stored `display_name` and `unit_price` if present; fallback to catalog p.name / pv.price.
+ * - Preserve duplicates (no grouping).
  */
 router.get('/:id/items', async (req, res) => {
   const estimateId = req.params.id;
@@ -297,11 +349,12 @@ router.get('/:id/items', async (req, res) => {
     const { rows: variationItems } = await pool.query(
       `SELECT 
          pv.id as variation_id,
+         COALESCE(ei.display_name, p.name) AS product_name,
          pv.size,
-         pv.price,
-         pv.accessory,
-         p.name as product_name,
-         ei.quantity
+         COALESCE(ei.unit_price, pv.price) AS price,   -- prefer saved unit price
+         COALESCE(ei.taxable, TRUE) AS taxable,        -- default true
+         ei.quantity,
+         pv.accessory
        FROM estimate_items ei
        JOIN product_variations pv ON ei.product_variation_id = pv.id
        JOIN products p ON pv.product_id = p.id
@@ -322,9 +375,9 @@ router.get('/:id/items', async (req, res) => {
         product_name: v.product_name,
         size: v.size,
         price: Number(v.price),
-        quantity: v.quantity,
+        quantity: Number(v.quantity),
         accessory: v.accessory,
-        taxable: true,
+        taxable: !!v.taxable,
         variation_id: v.variation_id
       })),
       ...customItems.map(c => ({
@@ -332,7 +385,7 @@ router.get('/:id/items', async (req, res) => {
         product_name: c.product_name,
         size: c.size,
         price: Number(c.price),
-        quantity: c.quantity,
+        quantity: Number(c.quantity),
         accessory: c.accessory,
         taxable: (c.taxable === true || c.taxable === 'true' || c.taxable === 1),
         variation_id: null
@@ -414,6 +467,10 @@ router.get('/search/customers', async (req, res) => {
  * Accepts optional { discount_type, discount_value, notes }.
  * - Carries estimate notes by default; request body notes override if provided.
  * - Computes invoice total respecting discount rules.
+ *
+ * Built-in items update:
+ * - Use stored `unit_price` and `display_name` from estimate items (not catalog),
+ *   and carry them to the invoice lines.
  */
 router.post('/:id/convert-to-invoice', async (req, res) => {
   const estimateId = req.params.id;
@@ -450,10 +507,15 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
     // request body notes override; invoices can store longer text
     const invNotes = toString(req.body?.notes ?? carriedNotes).slice(0, 2000);
 
-    // Load estimate items
+    // Load estimate items (variation + custom)
     const { rows: variationItems } = await client.query(
-      `SELECT ei.product_variation_id AS variation_id, ei.quantity,
-              pv.price, pv.size, pv.accessory, p.name AS product_name
+      `SELECT ei.product_variation_id AS variation_id,
+              ei.quantity,
+              COALESCE(ei.unit_price, pv.price) AS price,    -- prefer stored unit price
+              COALESCE(ei.taxable, TRUE) AS taxable,         -- default true
+              COALESCE(ei.display_name, p.name) AS product_name,
+              pv.size,
+              pv.accessory
          FROM estimate_items ei
          JOIN product_variations pv ON pv.id = ei.product_variation_id
          JOIN products p ON p.id = pv.product_id
@@ -484,18 +546,20 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
     let total = 0;
     let taxableTotal = 0;
 
-    // Variation items → invoice_items (taxable)
+    // Variation items → invoice_items (keep per-line overrides)
     for (const it of variationItems) {
       const qty = Number(it.quantity || 1);
       const price = Number(it.price || 0);
+      const isTaxable = it.taxable !== undefined ? !!it.taxable : true;
       const line = price * qty;
+
       total += line;
-      taxableTotal += line;
+      if (isTaxable) taxableTotal += line;
 
       await client.query(
-        `INSERT INTO invoice_items (invoice_id, product_variation_id, quantity, price, taxable)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [invoiceId, it.variation_id, qty, price, true]
+        `INSERT INTO invoice_items (invoice_id, product_variation_id, quantity, price, taxable, display_name)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [invoiceId, it.variation_id, qty, price, isTaxable, it.product_name || null]
       );
     }
 
