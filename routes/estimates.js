@@ -4,6 +4,9 @@ const router = express.Router();
 const pool = require('../db');
 const authenticate = require('../middleware/authenticate');
 
+const { ensureLineOverrideColumns } = require('../utils/ensureLineOverrideColumns');
+ensureLineOverrideColumns(); // fire-and-forget
+
 router.use(authenticate);
 
 // ----------------- helpers -----------------

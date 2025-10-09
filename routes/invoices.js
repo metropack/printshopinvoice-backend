@@ -6,6 +6,9 @@ const pool = require('../db');
 const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
 const toString = (v) => (v == null ? '' : String(v));
 
+const { ensureLineOverrideColumns } = require('../utils/ensureLineOverrideColumns');
+ensureLineOverrideColumns(); // fire-and-forget
+
 function sendDbError(res, err, label) {
   console.error(`❌ ${label}:`, err && err.stack ? err.stack : err);
   return res.status(500).json({
