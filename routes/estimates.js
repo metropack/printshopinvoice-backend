@@ -300,51 +300,61 @@ router.put('/:id', async (req, res) => {
 /**
  * GET /api/estimates/:id/items - Load estimate items (NO DEDUP, includes line_id)
  */
+// GET /api/estimates/:id/items
 router.get('/:id/items', async (req, res) => {
   const estimateId = req.params.id;
   const userId = req.user.id;
 
   try {
-    const check = await pool.query(
-      `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
+    // Ownership
+    const own = await pool.query(
+      `SELECT 1 FROM estimates WHERE id=$1 AND user_id=$2`,
       [estimateId, userId]
     );
-    if (check.rowCount === 0) {
+    if (own.rowCount === 0) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
+    // Built-in (variation) lines with overrides
     const { rows: variationItems } = await pool.query(
-      `SELECT 
-         ei.id AS line_id,
-         ei.product_variation_id AS variation_id,
-         COALESCE(ei.display_name, p.name) AS product_name,
-         pv.size,
-         COALESCE(ei.unit_price, pv.price) AS price,
-         ei.quantity,
-         COALESCE(ei.taxable, TRUE) AS taxable,
-         pv.accessory
-       FROM estimate_items ei
-       JOIN product_variations pv ON ei.product_variation_id = pv.id
-       JOIN products p ON pv.product_id = p.id
-       WHERE ei.estimate_id = $1
-       ORDER BY ei.id ASC`,
+      `
+      SELECT
+        ei.product_variation_id        AS variation_id,
+        pv.size,
+        COALESCE(ei.unit_price, pv.price)::numeric(12,2) AS price,
+        ei.quantity,
+        COALESCE(ei.taxable, TRUE)     AS taxable,
+        pv.accessory,
+        COALESCE(ei.display_name, p.name) AS product_name
+      FROM estimate_items ei
+      JOIN product_variations pv ON pv.id = ei.product_variation_id
+      JOIN products p           ON p.id  = pv.product_id
+      WHERE ei.estimate_id = $1
+      ORDER BY ei.id ASC
+      `,
       [estimateId]
     );
 
+    // Custom lines unchanged
     const { rows: customItems } = await pool.query(
-      `SELECT 
-         id AS line_id, product_name, size, price, quantity, accessory,
-         (CASE WHEN taxable IN (TRUE, 'true', 1) THEN TRUE ELSE FALSE END) AS taxable
-       FROM custom_estimate_items
-       WHERE estimate_id = $1
-       ORDER BY id ASC`,
+      `
+      SELECT
+        product_name,
+        size,
+        price::numeric(12,2)  AS price,
+        quantity,
+        accessory,
+        (CASE WHEN taxable IN (TRUE, 'true', 1) THEN TRUE ELSE FALSE END) AS taxable
+      FROM custom_estimate_items
+      WHERE estimate_id = $1
+      ORDER BY id ASC
+      `,
       [estimateId]
     );
 
-    const combined = [
+    const items = [
       ...variationItems.map(v => ({
         type: 'variation',
-        line_id: v.line_id,
         variation_id: v.variation_id,
         product_name: v.product_name,
         size: v.size,
@@ -355,7 +365,6 @@ router.get('/:id/items', async (req, res) => {
       })),
       ...customItems.map(c => ({
         type: 'custom',
-        line_id: c.line_id,
         variation_id: null,
         product_name: c.product_name,
         size: c.size,
@@ -366,12 +375,19 @@ router.get('/:id/items', async (req, res) => {
       })),
     ];
 
-    res.json(combined);
+    res.json(items);
   } catch (err) {
-    console.error('❌ Failed to load estimate items:', err);
+    console.error('❌ Estimates items GET failed:', {
+      message: err.message,
+      code: err.code,
+      detail: err.detail,
+      where: err.where,
+      stack: err.stack,
+    });
     res.status(500).json({ error: 'Failed to load estimate items' });
   }
 });
+
 
 /**
  * DELETE /api/estimates/:id
