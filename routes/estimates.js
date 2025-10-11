@@ -4,6 +4,7 @@ const router = express.Router();
 const pool = require('../db');
 const authenticate = require('../middleware/authenticate');
 
+
 router.use(authenticate);
 
 const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
@@ -16,7 +17,7 @@ const toBool = (v, def = true) => {
   return def;
 };
 
-/** GET /api/estimates — list, mine only (now returns discount fields) */
+/** GET /api/estimates — list, mine only */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
 
@@ -27,9 +28,7 @@ router.get('/', async (req, res) => {
          e.customer_info,
          e.estimate_date,
          ROUND(e.total, 2) AS total,
-         e.notes,
-         e.discount_type,
-         COALESCE(e.discount_value, 0) AS discount_value
+         e.notes
        FROM estimates e
        WHERE e.user_id = $1
        ORDER BY e.estimate_date DESC`,
@@ -49,7 +48,6 @@ router.get('/', async (req, res) => {
  * - allows per-line overrides: unit_price, taxable, display_name
  * - custom lines preserved with taxable flag
  * - notes ≤ 150 chars
- * - persists discount_type ('amount'|'percent') and discount_value
  */
 router.post('/', async (req, res) => {
   const userId = req.user.id;
@@ -59,8 +57,6 @@ router.post('/', async (req, res) => {
     variationItems = [],
     customItems = [],
     notes,
-    discount_type,
-    discount_value,
   } = req.body || {};
 
   const cleanNotes = toString(notes).trim();
@@ -68,21 +64,15 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'Notes must be 150 characters or fewer.' });
   }
 
-  // sanitize discount fields
-  const rawDT = String(discount_type || '').toLowerCase();
-  const discType = rawDT === 'percent' ? 'percent' : 'amount';
-  let discVal = Number(discount_value || 0);
-  discVal = discType === 'percent' ? clamp(discVal, 0, 100) : clamp(discVal, 0, 1e12);
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     const { rows: estRows } = await client.query(
-      `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes, discount_type, discount_value)
-       VALUES ($1, $2, $3, NOW(), 0, $4, $5, $6)
+      `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes)
+       VALUES ($1, $2, $3, NOW(), 0, $4)
        RETURNING id`,
-      [userId, customer_id ?? null, customer_info || {}, cleanNotes, discType, discVal]
+      [userId, customer_id ?? null, customer_info || {}, cleanNotes]
     );
     const estimateId = estRows[0].id;
 
@@ -173,11 +163,11 @@ router.post('/', async (req, res) => {
   }
 });
 
-/** PUT /api/estimates/:id — replace children (keeps duplicates, now persists discount fields) */
+/** PUT /api/estimates/:id — replace children (keeps duplicates) */
 router.put('/:id', async (req, res) => {
   const userId = req.user.id;
   const estimateId = parseInt(req.params.id, 10);
-  const { customer_info, variationItems = [], customItems = [], notes, discount_type, discount_value } = req.body || {};
+  const { customer_info, variationItems = [], customItems = [], notes } = req.body || {};
 
   if (!Number.isFinite(estimateId)) {
     return res.status(400).json({ error: 'Invalid estimate id' });
@@ -187,12 +177,6 @@ router.put('/:id', async (req, res) => {
   if (cleanNotes.length > 150) {
     return res.status(400).json({ error: 'Notes must be 150 characters or fewer.' });
   }
-
-  // sanitize discount fields
-  const rawDT = String(discount_type || '').toLowerCase();
-  const discType = rawDT === 'percent' ? 'percent' : 'amount';
-  let discVal = Number(discount_value || 0);
-  discVal = discType === 'percent' ? clamp(discVal, 0, 100) : clamp(discVal, 0, 1e12);
 
   const client = await pool.connect();
   try {
@@ -211,11 +195,9 @@ router.put('/:id', async (req, res) => {
       `UPDATE estimates
           SET customer_info = $1,
               estimate_date = NOW(),
-              notes = $2,
-              discount_type = $3,
-              discount_value = $4
-        WHERE id = $5 AND user_id = $6`,
-      [customer_info || {}, cleanNotes, discType, discVal, estimateId, userId]
+              notes = $2
+        WHERE id = $3 AND user_id = $4`,
+      [customer_info || {}, cleanNotes, estimateId, userId]
     );
 
     await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
@@ -341,7 +323,7 @@ router.get('/:id/items', async (req, res) => {
       SELECT
         product_name,
         size,
-        price::numeric(12,2) AS price,
+        price::numeric(12,2)  AS price,
         quantity,
         accessory,
         COALESCE(taxable, TRUE) AS taxable
@@ -420,7 +402,6 @@ router.delete('/:id', async (req, res) => {
 /**
  * POST /api/estimates/:id/convert-to-invoice
  * Keeps duplicates 1:1, carries edited name/price/taxable.
- * (No change needed here for estimate-loading discount issue)
  */
 router.post('/:id/convert-to-invoice', async (req, res) => {
   const estimateId = req.params.id;
@@ -477,6 +458,7 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       [estimateId]
     );
 
+    // Custom estimate lines
     const { rows: custItems } = await client.query(
       `SELECT
          product_name,
