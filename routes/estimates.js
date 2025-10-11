@@ -16,7 +16,7 @@ const toBool = (v, def = true) => {
   return def;
 };
 
-/** GET /api/estimates — list, mine only */
+/** GET /api/estimates — list, mine only (now returns discount fields) */
 router.get('/', async (req, res) => {
   const userId = req.user.id;
 
@@ -27,7 +27,9 @@ router.get('/', async (req, res) => {
          e.customer_info,
          e.estimate_date,
          ROUND(e.total, 2) AS total,
-         e.notes
+         e.notes,
+         e.discount_type,
+         COALESCE(e.discount_value, 0) AS discount_value
        FROM estimates e
        WHERE e.user_id = $1
        ORDER BY e.estimate_date DESC`,
@@ -47,6 +49,7 @@ router.get('/', async (req, res) => {
  * - allows per-line overrides: unit_price, taxable, display_name
  * - custom lines preserved with taxable flag
  * - notes ≤ 150 chars
+ * - persists discount_type ('amount'|'percent') and discount_value
  */
 router.post('/', async (req, res) => {
   const userId = req.user.id;
@@ -56,6 +59,8 @@ router.post('/', async (req, res) => {
     variationItems = [],
     customItems = [],
     notes,
+    discount_type,
+    discount_value,
   } = req.body || {};
 
   const cleanNotes = toString(notes).trim();
@@ -63,15 +68,21 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'Notes must be 150 characters or fewer.' });
   }
 
+  // sanitize discount fields
+  const rawDT = String(discount_type || '').toLowerCase();
+  const discType = rawDT === 'percent' ? 'percent' : 'amount';
+  let discVal = Number(discount_value || 0);
+  discVal = discType === 'percent' ? clamp(discVal, 0, 100) : clamp(discVal, 0, 1e12);
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     const { rows: estRows } = await client.query(
-      `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes)
-       VALUES ($1, $2, $3, NOW(), 0, $4)
+      `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes, discount_type, discount_value)
+       VALUES ($1, $2, $3, NOW(), 0, $4, $5, $6)
        RETURNING id`,
-      [userId, customer_id ?? null, customer_info || {}, cleanNotes]
+      [userId, customer_id ?? null, customer_info || {}, cleanNotes, discType, discVal]
     );
     const estimateId = estRows[0].id;
 
@@ -162,11 +173,11 @@ router.post('/', async (req, res) => {
   }
 });
 
-/** PUT /api/estimates/:id — replace children (keeps duplicates) */
+/** PUT /api/estimates/:id — replace children (keeps duplicates, now persists discount fields) */
 router.put('/:id', async (req, res) => {
   const userId = req.user.id;
   const estimateId = parseInt(req.params.id, 10);
-  const { customer_info, variationItems = [], customItems = [], notes } = req.body || {};
+  const { customer_info, variationItems = [], customItems = [], notes, discount_type, discount_value } = req.body || {};
 
   if (!Number.isFinite(estimateId)) {
     return res.status(400).json({ error: 'Invalid estimate id' });
@@ -176,6 +187,12 @@ router.put('/:id', async (req, res) => {
   if (cleanNotes.length > 150) {
     return res.status(400).json({ error: 'Notes must be 150 characters or fewer.' });
   }
+
+  // sanitize discount fields
+  const rawDT = String(discount_type || '').toLowerCase();
+  const discType = rawDT === 'percent' ? 'percent' : 'amount';
+  let discVal = Number(discount_value || 0);
+  discVal = discType === 'percent' ? clamp(discVal, 0, 100) : clamp(discVal, 0, 1e12);
 
   const client = await pool.connect();
   try {
@@ -194,9 +211,11 @@ router.put('/:id', async (req, res) => {
       `UPDATE estimates
           SET customer_info = $1,
               estimate_date = NOW(),
-              notes = $2
-        WHERE id = $3 AND user_id = $4`,
-      [customer_info || {}, cleanNotes, estimateId, userId]
+              notes = $2,
+              discount_type = $3,
+              discount_value = $4
+        WHERE id = $5 AND user_id = $6`,
+      [customer_info || {}, cleanNotes, discType, discVal, estimateId, userId]
     );
 
     await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
@@ -298,39 +317,37 @@ router.get('/:id/items', async (req, res) => {
     }
 
     // Built-in (variation) lines with overrides — tolerant to missing PV/product rows
-const { rows: variationItems } = await pool.query(
-  `
-  SELECT
-    ei.product_variation_id                             AS variation_id,
-    COALESCE(pv.size, '')                               AS size,
-    COALESCE(ei.unit_price, pv.price, 0)::numeric(12,2) AS price,
-    ei.quantity,
-    COALESCE(ei.taxable, TRUE)                          AS taxable,
-    COALESCE(pv.accessory, '')                          AS accessory,
-    COALESCE(ei.display_name, p.name, 'Item')           AS product_name
-  FROM estimate_items ei
-  LEFT JOIN product_variations pv ON pv.id = ei.product_variation_id
-  LEFT JOIN products p            ON p.id = pv.product_id
-  WHERE ei.estimate_id = $1
-  ORDER BY ei.id ASC
-  `,
-  [estimateId]
-);
-
+    const { rows: variationItems } = await pool.query(
+      `
+      SELECT
+        ei.product_variation_id                             AS variation_id,
+        COALESCE(pv.size, '')                               AS size,
+        COALESCE(ei.unit_price, pv.price, 0)::numeric(12,2) AS price,
+        ei.quantity,
+        COALESCE(ei.taxable, TRUE)                          AS taxable,
+        COALESCE(pv.accessory, '')                          AS accessory,
+        COALESCE(ei.display_name, p.name, 'Item')           AS product_name
+      FROM estimate_items ei
+      LEFT JOIN product_variations pv ON pv.id = ei.product_variation_id
+      LEFT JOIN products p            ON p.id = pv.product_id
+      WHERE ei.estimate_id = $1
+      ORDER BY ei.id ASC
+      `,
+      [estimateId]
+    );
 
     const { rows: customItems } = await pool.query(
       `
       SELECT
-  product_name,
-  size,
-  price::numeric(12,2) AS price,
-  quantity,
-  accessory,
-  COALESCE(taxable, TRUE) AS taxable
-FROM custom_estimate_items
-WHERE estimate_id = $1
-ORDER BY id ASC
-
+        product_name,
+        size,
+        price::numeric(12,2) AS price,
+        quantity,
+        accessory,
+        COALESCE(taxable, TRUE) AS taxable
+      FROM custom_estimate_items
+      WHERE estimate_id = $1
+      ORDER BY id ASC
       `,
       [estimateId]
     );
@@ -403,6 +420,7 @@ router.delete('/:id', async (req, res) => {
 /**
  * POST /api/estimates/:id/convert-to-invoice
  * Keeps duplicates 1:1, carries edited name/price/taxable.
+ * (No change needed here for estimate-loading discount issue)
  */
 router.post('/:id/convert-to-invoice', async (req, res) => {
   const estimateId = req.params.id;
@@ -459,21 +477,19 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
       [estimateId]
     );
 
-   // 1) In convert-to-invoice (reading custom estimate lines)
-const { rows: custItems } = await client.query(
-  `SELECT
-     product_name,
-     size,
-     price::numeric(12,2) AS price,
-     quantity,
-     accessory,
-     COALESCE(taxable, TRUE) AS taxable
-   FROM custom_estimate_items
-   WHERE estimate_id = $1
-   ORDER BY id ASC`,
-  [estimateId]
-);
-
+    const { rows: custItems } = await client.query(
+      `SELECT
+         product_name,
+         size,
+         price::numeric(12,2) AS price,
+         quantity,
+         accessory,
+         COALESCE(taxable, TRUE) AS taxable
+       FROM custom_estimate_items
+       WHERE estimate_id = $1
+       ORDER BY id ASC`,
+      [estimateId]
+    );
 
     let taxableSubtotal = 0;
     let nonTaxableSubtotal = 0;
