@@ -3,7 +3,7 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 const authenticate = require('../middleware/authenticate');
-
+const { sendMail } = require('../utils/mailer');
 
 router.use(authenticate);
 
@@ -79,20 +79,18 @@ router.post('/', async (req, res) => {
     let taxableSubtotal = 0;
     let nonTaxableSubtotal = 0;
 
-    // Built-in lines
+    // Built-in lines with overrides
     for (const it of (Array.isArray(variationItems) ? variationItems : [])) {
       const variationId = Number(it.variation_id ?? it.variationId);
       if (!Number.isFinite(variationId)) continue;
 
       const qty = Math.max(1, parseInt(it.quantity, 10) || 1);
 
-      // overrides (unit_price, taxable, display_name)
       const overridePrice = it.unit_price != null ? Number(it.unit_price) : Number(it.price);
       const hasOverridePrice = Number.isFinite(overridePrice);
       const displayName = toString(it.display_name || it.product_name || '').trim() || null;
       const taxable = toBool(it.taxable, true);
 
-      // fall back to PV price if no override
       let lineUnitPrice = hasOverridePrice ? overridePrice : null;
       if (lineUnitPrice == null) {
         const { rows: priceRows } = await client.query(
@@ -298,7 +296,7 @@ router.get('/:id/items', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    // Built-in (variation) lines with overrides — tolerant to missing PV/product rows
+    // Built-in (variation) lines
     const { rows: variationItems } = await pool.query(
       `
       SELECT
@@ -367,35 +365,6 @@ router.get('/:id/items', async (req, res) => {
       stack: err.stack,
     });
     res.status(500).json({ error: 'Failed to load estimate items' });
-  }
-});
-
-/** DELETE /api/estimates/:id */
-router.delete('/:id', async (req, res) => {
-  const estimateId = req.params.id;
-  const userId = req.user.id;
-
-  if (!/^\d+$/.test(String(estimateId))) {
-    return res.status(400).json({ error: 'Invalid estimate id' });
-  }
-
-  try {
-    const check = await pool.query(
-      `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
-      [estimateId, userId]
-    );
-    if (check.rowCount === 0) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    await pool.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
-    await pool.query(`DELETE FROM custom_estimate_items WHERE estimate_id = $1`, [estimateId]);
-    await pool.query(`DELETE FROM estimates WHERE id = $1 AND user_id = $2`, [estimateId, userId]);
-
-    res.json({ message: 'Estimate deleted' });
-  } catch (err) {
-    console.error('❌ Error deleting estimate:', err);
-    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -545,6 +514,99 @@ router.post('/:id/convert-to-invoice', async (req, res) => {
     res.status(500).json({ error: 'Failed to convert estimate to invoice' });
   } finally {
     client.release();
+  }
+});
+
+/**
+ * POST /api/estimates/:id/email
+ * Send an estimate PDF to the customer using store info as Reply-To (if present).
+ * Body: { pdf_base64, to?, subject?, message_html?, message_text?, reply_to? }
+ */
+router.post('/:id/email', async (req, res) => {
+  const userId = req.user.id;
+  const estimateId = Number(req.params.id);
+
+  try {
+    const hdr = await pool.query(
+      'SELECT customer_info FROM estimates WHERE id = $1 AND user_id = $2',
+      [estimateId, userId]
+    );
+    if (hdr.rowCount === 0) return res.status(403).json({ error: 'Access denied' });
+
+    const customer = hdr.rows[0]?.customer_info || {};
+    const fallbackTo = (customer.email || '').trim();
+    const {
+      to = fallbackTo,
+      pdf_base64,
+      subject,
+      message_html,
+      message_text,
+      reply_to,
+    } = req.body || {};
+
+    if (!to) return res.status(400).json({ error: 'Customer email is missing.' });
+    if (!pdf_base64) return res.status(400).json({ error: 'Missing pdf_base64' });
+
+    // Store Reply-To
+    const s = await pool.query(
+      `SELECT email, name FROM store_info WHERE user_id = $1 LIMIT 1`,
+      [userId]
+    );
+    const storeEmail = (s.rows[0]?.email || '').trim();
+    const storeName = (s.rows[0]?.name || '').trim();
+    const replyToAddr =
+      reply_to || (storeEmail ? `${storeName ? storeName + ' ' : ''}<${storeEmail}>` : undefined);
+
+    // Base64 → Buffer
+    const clean = String(pdf_base64).replace(/^data:application\/pdf;base64,/, '');
+    const pdfBuffer = Buffer.from(clean, 'base64');
+
+    const defaultSubject = subject || `Estimate #${estimateId} from ${storeName || 'Print Shop'}`;
+    const defaultText = message_text || 'Please find your estimate attached.';
+    const defaultHtml = message_html || `<p>Please find your estimate attached.</p>`;
+
+    await sendMail({
+      to,
+      subject: defaultSubject,
+      text: defaultText,
+      html: defaultHtml,
+      replyTo: replyToAddr,
+      attachments: [{ filename: `estimate-${estimateId}.pdf`, content: pdfBuffer }],
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Email estimate failed:', err);
+    res.status(500).json({ error: 'Failed to send email' });
+  }
+});
+
+/** DELETE /api/estimates/:id */
+router.delete('/:id', async (req, res) => {
+  const estimateId = req.params.id;
+  const userId = req.user.id;
+
+  if (!/^\d+$/.test(String(estimateId))) {
+    return res.status(400).json({ error: 'Invalid estimate id' });
+  }
+
+  try {
+    const check = await pool.query(
+      `SELECT 1 FROM estimates WHERE id = $1 AND user_id = $2`,
+      [estimateId, userId]
+    );
+    if (check.rowCount === 0) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    await pool.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
+    await pool.query(`DELETE FROM custom_estimate_items WHERE estimate_id = $1`, [estimateId]);
+    await pool.query(`DELETE FROM estimates WHERE id = $1 AND user_id = $2`, [estimateId, userId]);
+
+    res.json({ message: 'Estimate deleted' });
+  } catch (err) {
+    console.error('❌ Error deleting estimate:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

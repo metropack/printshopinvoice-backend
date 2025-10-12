@@ -2,7 +2,11 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
+// const authenticate = require('../middleware/authenticate'); // If not mounted globally
+const { sendMail } = require('../utils/mailer');
+
 // If you mount authenticate/subscription in index.js, you don't need router.use(authenticate) here.
+// router.use(authenticate);
 
 const clamp = (v, min, max) => Math.min(Math.max(Number(v) || 0, min), max);
 const toString = (v) => (v == null ? '' : String(v));
@@ -13,6 +17,72 @@ const toBool = (v, def = true) => {
   if (typeof v === 'string') return !['false', '0', 'no', 'off'].includes(v.toLowerCase());
   return def;
 };
+
+/**
+ * POST /api/invoices/:id/email
+ * Send an invoice PDF to the customer using store info as Reply-To (if present).
+ * Body: { pdf_base64, to?, subject?, message_html?, message_text?, reply_to? }
+ */
+router.post('/:id/email', async (req, res) => {
+  const userId = req.user.id;
+  const invoiceId = Number(req.params.id);
+
+  try {
+    // Ownership check
+    const hdr = await pool.query(
+      'SELECT customer_info FROM invoices WHERE id=$1 AND user_id=$2',
+      [invoiceId, userId]
+    );
+    if (hdr.rowCount === 0) return res.status(403).json({ error: 'Access denied' });
+
+    const customer = hdr.rows[0]?.customer_info || {};
+    const fallbackTo = (customer.email || '').trim();
+    const {
+      to = fallbackTo,
+      pdf_base64,
+      subject,
+      message_html,
+      message_text,
+      reply_to,
+    } = req.body || {};
+
+    if (!to) return res.status(400).json({ error: 'Customer email is missing.' });
+    if (!pdf_base64) return res.status(400).json({ error: 'Missing pdf_base64' });
+
+    // Get store reply-to (optional)
+    const s = await pool.query(
+      `SELECT email, name FROM store_info WHERE user_id = $1 LIMIT 1`,
+      [userId]
+    );
+    const storeEmail = (s.rows[0]?.email || '').trim();
+    const storeName = (s.rows[0]?.name || '').trim();
+    const replyToAddr =
+      reply_to || (storeEmail ? `${storeName ? storeName + ' ' : ''}<${storeEmail}>` : undefined);
+
+    // Base64 → Buffer
+    const clean = String(pdf_base64).replace(/^data:application\/pdf;base64,/, '');
+    const pdfBuffer = Buffer.from(clean, 'base64');
+
+    // Defaults
+    const defaultSubject = subject || `Invoice #${invoiceId} from ${storeName || 'Print Shop'}`;
+    const defaultText = message_text || 'Please find your invoice attached.';
+    const defaultHtml = message_html || `<p>Please find your invoice attached.</p>`;
+
+    await sendMail({
+      to,
+      subject: defaultSubject,
+      text: defaultText,
+      html: defaultHtml,
+      replyTo: replyToAddr,
+      attachments: [{ filename: `invoice-${invoiceId}.pdf`, content: pdfBuffer }],
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Email invoice failed:', err);
+    res.status(500).json({ error: 'Failed to send email' });
+  }
+});
 
 /**
  * POST /api/invoices
@@ -56,7 +126,7 @@ router.post('/', async (req, res) => {
     let taxableSubtotal = 0;
     let nonTaxableSubtotal = 0;
 
-    // Built-in lines (already priced by client or previous conversion)
+    // Built-in lines
     for (const it of (Array.isArray(variationItems) ? variationItems : [])) {
       const variationId = Number(it.variation_id ?? it.variationId);
       if (!Number.isFinite(variationId)) continue;
@@ -109,7 +179,7 @@ router.post('/', async (req, res) => {
     );
     const taxRate = Number(rateRows[0]?.tax_rate ?? 0.06);
 
-    // Final total (respect discount rules)
+    // Final total
     let finalTotal;
     if (discType === 'amount') {
       const baseGrand = taxableSubtotal * (1 + taxRate) + nonTaxableSubtotal;
@@ -268,42 +338,41 @@ router.get('/:id/items', async (req, res) => {
     }
 
     const { rows: variationItems } = await pool.query(
-  `
-  SELECT
-    ii.id AS line_id,
-    ii.product_variation_id                              AS variation_id,
-    COALESCE(ii.display_name, p.name, 'Item')            AS product_name,
-    COALESCE(pv.size, '')                                 AS size,
-    COALESCE(ii.price, pv.price, 0)::numeric(12,2)        AS price,
-    ii.quantity,
-    COALESCE(ii.taxable, TRUE)                            AS taxable,
-    COALESCE(pv.accessory, '')                            AS accessory
-  FROM invoice_items ii
-  LEFT JOIN product_variations pv ON ii.product_variation_id = pv.id
-  LEFT JOIN products p            ON pv.product_id = p.id
-  WHERE ii.invoice_id = $1
-  ORDER BY ii.id ASC
-  `,
-  [invoiceId]
-);
+      `
+      SELECT
+        ii.id AS line_id,
+        ii.product_variation_id                              AS variation_id,
+        COALESCE(ii.display_name, p.name, 'Item')            AS product_name,
+        COALESCE(pv.size, '')                                AS size,
+        COALESCE(ii.price, pv.price, 0)::numeric(12,2)       AS price,
+        ii.quantity,
+        COALESCE(ii.taxable, TRUE)                           AS taxable,
+        COALESCE(pv.accessory, '')                           AS accessory
+      FROM invoice_items ii
+      LEFT JOIN product_variations pv ON ii.product_variation_id = pv.id
+      LEFT JOIN products p            ON pv.product_id = p.id
+      WHERE ii.invoice_id = $1
+      ORDER BY ii.id ASC
+      `,
+      [invoiceId]
+    );
 
-
- // 2) In GET /api/invoices/:id/items (custom invoice lines)
-const { rows: customItems } = await pool.query(
-  `SELECT
-     id AS line_id,
-     product_name,
-     size,
-     price::numeric(12,2) AS price,
-     quantity,
-     accessory,
-     COALESCE(taxable, TRUE) AS taxable
-   FROM custom_invoice_items
-   WHERE invoice_id = $1
-   ORDER BY id ASC`,
-  [invoiceId]
-);
-
+    const { rows: customItems } = await pool.query(
+      `
+      SELECT
+        id AS line_id,
+        product_name,
+        size,
+        price::numeric(12,2) AS price,
+        quantity,
+        accessory,
+        COALESCE(taxable, TRUE) AS taxable
+      FROM custom_invoice_items
+      WHERE invoice_id = $1
+      ORDER BY id ASC
+      `,
+      [invoiceId]
+    );
 
     const combinedItems = [
       ...variationItems.map(v => ({
