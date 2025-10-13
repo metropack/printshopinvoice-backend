@@ -49,31 +49,38 @@ router.post('/:id/email', async (req, res) => {
     if (!to) return res.status(400).json({ error: 'Customer email is missing.' });
     if (!pdf_base64) return res.status(400).json({ error: 'Missing pdf_base64' });
 
-    // Get store reply-to (optional)
+    // Get store name & email (for From/Reply-To)
     const s = await pool.query(
       `SELECT email, name FROM store_info WHERE user_id = $1 LIMIT 1`,
       [userId]
     );
     const storeEmail = (s.rows[0]?.email || '').trim();
-    const storeName = (s.rows[0]?.name || '').trim();
+    const storeName  = (s.rows[0]?.name  || '').trim() || 'Your Store';
+
+    // Visible header From address (email part) — prefer MAIL_FROM, then SMTP_FROM, then SMTP_USER
+    const headerFromEmail =
+      process.env.MAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER;
+
+    // Replies should go to the store mailbox if present
     const replyToAddr =
-      reply_to || (storeEmail ? `${storeName ? storeName + ' ' : ''}<${storeEmail}>` : undefined);
+      reply_to || (storeEmail ? `${storeName} <${storeEmail}>` : undefined);
 
     // Base64 → Buffer
     const clean = String(pdf_base64).replace(/^data:application\/pdf;base64,/, '');
     const pdfBuffer = Buffer.from(clean, 'base64');
 
     // Defaults
-    const defaultSubject = subject || `Invoice #${invoiceId} from ${storeName || 'Print Shop'}`;
-    const defaultText = message_text || 'Please find your invoice attached.';
-    const defaultHtml = message_html || `<p>Please find your invoice attached.</p>`;
+    const defaultSubject = subject || `Invoice #${invoiceId} from ${storeName}`;
+    const defaultText    = message_text || 'Please find your invoice attached.';
+    const defaultHtml    = message_html || `<p>Please find your invoice attached.</p>`;
 
     await sendMail({
+      from: { email: headerFromEmail, name: storeName }, // 👈 visible From shows the store name
       to,
       subject: defaultSubject,
       text: defaultText,
       html: defaultHtml,
-      replyTo: replyToAddr,
+      replyTo: replyToAddr,                              // 👈 replies go to store email
       attachments: [{ filename: `invoice-${invoiceId}.pdf`, content: pdfBuffer }],
     });
 

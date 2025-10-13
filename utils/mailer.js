@@ -64,7 +64,7 @@ async function sendMail({ to, subject, text, html, replyTo, attachments, from })
       const retryOpts = {
         ...baseOpts,
         from: `${DEFAULT_FROM_NAME} <${user}>`,  // header From = support@
-        replyTo: replyTo || headerFrom,          // replies still go to receipts@
+        replyTo: replyTo || headerFrom,          // replies still go to receipts@ (or custom)
       };
       return transporter.sendMail(retryOpts);
     }
