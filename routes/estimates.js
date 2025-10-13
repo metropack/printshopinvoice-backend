@@ -561,11 +561,12 @@ router.post('/:id/email', async (req, res) => {
     const clean = String(pdf_base64).replace(/^data:application\/pdf;base64,/, '');
     const pdfBuffer = Buffer.from(clean, 'base64');
 
-    const defaultSubject = subject || `Estimate #${estimateId} from ${storeName || 'Print Shop'}`;
+        const defaultSubject = subject || `Estimate #${estimateId} from ${storeName || 'Print Shop'}`;
     const defaultText = message_text || 'Please find your estimate attached.';
     const defaultHtml = message_html || `<p>Please find your estimate attached.</p>`;
 
     await sendMail({
+      from: 'receipts@printshopinvoice.com',        // <-- add this line
       to,
       subject: defaultSubject,
       text: defaultText,
@@ -575,6 +576,7 @@ router.post('/:id/email', async (req, res) => {
     });
 
     res.json({ ok: true });
+
   } catch (err) {
     console.error('Email estimate failed:', err);
     res.status(500).json({ error: 'Failed to send email' });
