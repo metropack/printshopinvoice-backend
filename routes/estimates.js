@@ -565,16 +565,15 @@ router.post('/:id/email', async (req, res) => {
     const defaultText = message_text || 'Please find your estimate attached.';
     const defaultHtml = message_html || `<p>Please find your estimate attached.</p>`;
 
-    await sendMail({
-      from: 'receipts@printshopinvoice.com',        // <-- add this line
-      to,
-      subject: defaultSubject,
-      text: defaultText,
-      html: defaultHtml,
-      replyTo: replyToAddr,
-      attachments: [{ filename: `estimate-${estimateId}.pdf`, content: pdfBuffer }],
-    });
-
+   await sendMail({
+  from: { email: 'receipts@printshopinvoice.com', name: storeName || 'Print Shop' }, // 👈
+  to,
+  subject: defaultSubject,
+  text: defaultText,
+  html: defaultHtml,
+  replyTo: replyToAddr,
+  attachments: [{ filename: `estimate-${estimateId}.pdf`, content: pdfBuffer }],
+});
     res.json({ ok: true });
 
   } catch (err) {
