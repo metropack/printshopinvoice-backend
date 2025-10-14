@@ -28,6 +28,8 @@ router.get('/', async (req, res) => {
          e.customer_info,
          e.estimate_date,
          ROUND(e.total, 2) AS total,
+         e.discount_type,
+         e.discount_value,
          e.notes
        FROM estimates e
        WHERE e.user_id = $1
@@ -39,6 +41,34 @@ router.get('/', async (req, res) => {
   } catch (err) {
     console.error('❌ Error fetching estimates:', err);
     res.status(500).json({ error: 'Failed to load estimates' });
+  }
+});
+
+/** GET /api/estimates/:id — header only */
+router.get('/:id', async (req, res) => {
+  const estimateId = req.params.id;
+  const userId = req.user.id;
+
+  try {
+    const { rows, rowCount } = await pool.query(
+      `
+      SELECT id,
+             customer_info,
+             estimate_date,
+             ROUND(total, 2) AS total,
+             discount_type,
+             discount_value,
+             notes
+        FROM estimates
+       WHERE id = $1 AND user_id = $2
+      `,
+      [estimateId, userId]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'Estimate not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('❌ Estimate GET failed:', err);
+    res.status(500).json({ error: 'Failed to load estimate' });
   }
 });
 
@@ -57,6 +87,8 @@ router.post('/', async (req, res) => {
     variationItems = [],
     customItems = [],
     notes,
+    discount_type,
+    discount_value,
   } = req.body || {};
 
   const cleanNotes = toString(notes).trim();
@@ -64,15 +96,18 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'Notes must be 150 characters or fewer.' });
   }
 
+  const discType = String(discount_type || '').toLowerCase() === 'percent' ? 'percent' : 'amount';
+  const discVal = Number(discount_value || 0);
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     const { rows: estRows } = await client.query(
-      `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes)
-       VALUES ($1, $2, $3, NOW(), 0, $4)
+      `INSERT INTO estimates (user_id, customer_id, customer_info, estimate_date, total, notes, discount_type, discount_value)
+       VALUES ($1, $2, $3, NOW(), 0, $4, $5, $6)
        RETURNING id`,
-      [userId, customer_id ?? null, customer_info || {}, cleanNotes]
+      [userId, customer_id ?? null, customer_info || {}, cleanNotes, discType, discVal]
     );
     const estimateId = estRows[0].id;
 
@@ -165,7 +200,7 @@ router.post('/', async (req, res) => {
 router.put('/:id', async (req, res) => {
   const userId = req.user.id;
   const estimateId = parseInt(req.params.id, 10);
-  const { customer_info, variationItems = [], customItems = [], notes } = req.body || {};
+  const { customer_info, variationItems = [], customItems = [], notes, discount_type, discount_value } = req.body || {};
 
   if (!Number.isFinite(estimateId)) {
     return res.status(400).json({ error: 'Invalid estimate id' });
@@ -175,6 +210,9 @@ router.put('/:id', async (req, res) => {
   if (cleanNotes.length > 150) {
     return res.status(400).json({ error: 'Notes must be 150 characters or fewer.' });
   }
+
+  const discType = String(discount_type || '').toLowerCase() === 'percent' ? 'percent' : 'amount';
+  const discVal = Number(discount_value || 0);
 
   const client = await pool.connect();
   try {
@@ -193,9 +231,11 @@ router.put('/:id', async (req, res) => {
       `UPDATE estimates
           SET customer_info = $1,
               estimate_date = NOW(),
-              notes = $2
-        WHERE id = $3 AND user_id = $4`,
-      [customer_info || {}, cleanNotes, estimateId, userId]
+              notes = $2,
+              discount_type = $3,
+              discount_value = $4
+        WHERE id = $5 AND user_id = $6`,
+      [customer_info || {}, cleanNotes, discType, discVal, estimateId, userId]
     );
 
     await client.query(`DELETE FROM estimate_items WHERE estimate_id = $1`, [estimateId]);
@@ -561,21 +601,20 @@ router.post('/:id/email', async (req, res) => {
     const clean = String(pdf_base64).replace(/^data:application\/pdf;base64,/, '');
     const pdfBuffer = Buffer.from(clean, 'base64');
 
-        const defaultSubject = subject || `Estimate #${estimateId} from ${storeName || 'Print Shop'}`;
+    const defaultSubject = subject || `Estimate #${estimateId} from ${storeName || 'Print Shop'}`;
     const defaultText = message_text || 'Please find your estimate attached.';
     const defaultHtml = message_html || `<p>Please find your estimate attached.</p>`;
 
-   await sendMail({
-  from: { email: 'receipts@printshopinvoice.com', name: storeName || 'Print Shop' }, // 👈
-  to,
-  subject: defaultSubject,
-  text: defaultText,
-  html: defaultHtml,
-  replyTo: replyToAddr,
-  attachments: [{ filename: `estimate-${estimateId}.pdf`, content: pdfBuffer }],
-});
+    await sendMail({
+      from: { email: 'receipts@printshopinvoice.com', name: storeName || 'Print Shop' },
+      to,
+      subject: defaultSubject,
+      text: defaultText,
+      html: defaultHtml,
+      replyTo: replyToAddr,
+      attachments: [{ filename: `estimate-${estimateId}.pdf`, content: pdfBuffer }],
+    });
     res.json({ ok: true });
-
   } catch (err) {
     console.error('Email estimate failed:', err);
     res.status(500).json({ error: 'Failed to send email' });
