@@ -72,6 +72,8 @@ app.use('/invoices', express.static(p.join(__dirname, 'invoices')));
 app.use('/uploads',  express.static(p.join(__dirname, 'uploads')));
 const supportRoutesMod = require('./routes/support');
 app.use('/api', resolveRouter(supportRoutesMod));  // <-- gives you /api/support
+const freightRoutesMod = require('./routes/freight');
+app.use('/api', resolveRouter(freightRoutesMod));  // <-- gives you /api/freight
 
 /* ───────────────────────── Routes ───────────────────────── */
 const authRoutesMod        = require('./routes/authRoutes');
