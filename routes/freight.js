@@ -1,36 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const nodemailer = require('nodemailer');
+const { sendMail } = require('../utils/mailer');
+
+const isEmail = (s = '') => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(s).trim());
 
 router.get('/freight-test', (_req, res) => {
   res.json({ ok: true, route: 'freight.js is live' });
 });
-
-const isEmail = (s = '') => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
-
-function makeTransport() {
-  const port = Number(process.env.SMTP_PORT || 587);
-  const secure =
-    port === 465 ||
-    String(process.env.SMTP_SECURE || 'false').toLowerCase() === 'true';
-
-  const base = {
-    host: process.env.SMTP_HOST,
-    port,
-    secure,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    requireTLS: !secure,
-    tls: { minVersion: 'TLSv1.2' },
-  };
-
-  if (String(process.env.SMTP_DEBUG || '0') === '1') {
-    base.logger = true;
-    base.debug = true;
-    console.log('[smtp freight]', { host: base.host, port: base.port, secure: base.secure });
-  }
-
-  return nodemailer.createTransport(base);
-}
 
 router.post('/freight', async (req, res) => {
   try {
@@ -60,77 +36,77 @@ router.post('/freight', async (req, res) => {
       notes = '',
     } = req.body || {};
 
-    if (!isEmail(email)) {
+    const cleanEmail = String(email).trim();
+    if (!isEmail(cleanEmail)) {
       return res.status(400).json({ error: 'Valid email is required.' });
     }
 
-    const transporter = makeTransport();
-    await transporter.verify();
+    const freightToRaw = process.env.FREIGHT_TO_EMAIL;
+    const freightTo = String(freightToRaw || 'livonia@metropackandship.com').trim();
 
-    const FREIGHT_TO_EMAIL =
-      process.env.FREIGHT_TO_EMAIL || 'livonia@metropackandship.com';
+    if (!isEmail(freightTo)) {
+      console.error('Freight mail config error: invalid FREIGHT_TO_EMAIL', {
+        freightToRaw,
+        freightTo,
+      });
+      return res.status(500).json({ error: 'Freight email recipient is not configured correctly.' });
+    }
 
-    const FROM_EMAIL = process.env.FROM_EMAIL || process.env.SMTP_USER;
-    const MAILBOX = process.env.SMTP_USER;
-
-    const adminSubject = `🚚 Freight Quote Request — ${name || email || 'New Request'}`;
+    const adminSubject = `🚚 Freight Quote Request — ${String(name).trim() || cleanEmail || 'New Request'}`;
 
     const adminText = [
       'Type: Freight Quote',
-      `Name: ${name}`,
-      `Company: ${company}`,
-      `Email: ${email}`,
-      `Phone: ${phone}`,
+      `Name: ${String(name).trim()}`,
+      `Company: ${String(company).trim()}`,
+      `Email: ${cleanEmail}`,
+      `Phone: ${String(phone).trim()}`,
       '',
-      `Pickup Location: ${pickupLocation}`,
-      `Delivery Location: ${deliveryLocation}`,
-      `Pickup Type: ${pickupType}`,
-      `Delivery Type: ${deliveryType}`,
-      `Pallet Count / Pieces: ${palletCount}`,
-      `Packaging Type: ${packagingType}`,
-      `Length (in): ${length}`,
-      `Width (in): ${width}`,
-      `Height (in): ${height}`,
-      `Weight Per Pallet (lbs): ${weight}`,
-      `Total Shipment Weight (lbs): ${totalWeight}`,
-      `Stackable: ${stackable}`,
-      `Liftgate Pickup: ${liftgatePickup}`,
-      `Liftgate Delivery: ${liftgateDelivery}`,
-      `Inside Pickup: ${insidePickup}`,
-      `Inside Delivery: ${insideDelivery}`,
-      `Ready Date: ${readyDate}`,
-      `Commodity: ${commodity}`,
+      `Pickup Location: ${String(pickupLocation).trim()}`,
+      `Delivery Location: ${String(deliveryLocation).trim()}`,
+      `Pickup Type: ${String(pickupType).trim()}`,
+      `Delivery Type: ${String(deliveryType).trim()}`,
+      `Pallet Count / Pieces: ${String(palletCount).trim()}`,
+      `Packaging Type: ${String(packagingType).trim()}`,
+      `Length (in): ${String(length).trim()}`,
+      `Width (in): ${String(width).trim()}`,
+      `Height (in): ${String(height).trim()}`,
+      `Weight Per Pallet (lbs): ${String(weight).trim()}`,
+      `Total Shipment Weight (lbs): ${String(totalWeight).trim()}`,
+      `Stackable: ${String(stackable).trim()}`,
+      `Liftgate Pickup: ${String(liftgatePickup).trim()}`,
+      `Liftgate Delivery: ${String(liftgateDelivery).trim()}`,
+      `Inside Pickup: ${String(insidePickup).trim()}`,
+      `Inside Delivery: ${String(insideDelivery).trim()}`,
+      `Ready Date: ${String(readyDate).trim()}`,
+      `Commodity: ${String(commodity).trim()}`,
       '',
       'Additional Notes:',
-      notes,
+      String(notes).trim(),
     ].join('\n');
 
-    await transporter.sendMail({
-      from: FROM_EMAIL,
-      sender: MAILBOX,
-      envelope: { from: MAILBOX, to: FREIGHT_TO_EMAIL },
-      to: FREIGHT_TO_EMAIL,
-      replyTo: email,
+    await sendMail({
+      to: freightTo,
       subject: adminSubject,
       text: adminText,
+      replyTo: cleanEmail,
+      from: 'Metro Pack And Ship <livonia@metropackandship.com>',
     });
 
-    await transporter.sendMail({
-      from: FROM_EMAIL,
-      sender: MAILBOX,
-      envelope: { from: MAILBOX, to: email },
-      to: email,
+    await sendMail({
+      to: cleanEmail,
       subject: 'We received your freight quote request',
       text:
-        `Hi${name ? ' ' + name : ''},\n\n` +
+        `Hi${String(name).trim() ? ' ' + String(name).trim() : ''},\n\n` +
         `Thanks for contacting Metro Pack And Ship. We received your freight quote request and will review your shipment details as soon as possible.\n\n` +
         `— Metro Pack And Ship`,
+      replyTo: freightTo,
+      from: 'Metro Pack And Ship <livonia@metropackandship.com>',
     });
 
     res.json({ ok: true });
   } catch (e) {
     console.error('Freight mail error:', e);
-    res.status(500).json({ error: 'Could not send freight email right now.' });
+    res.status(500).json({ error: e?.message || 'Could not send freight email right now.' });
   }
 });
 
