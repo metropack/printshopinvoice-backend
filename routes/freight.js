@@ -2,6 +2,10 @@ const express = require('express');
 const router = express.Router();
 const nodemailer = require('nodemailer');
 
+router.get('/freight-test', (_req, res) => {
+  res.json({ ok: true, route: 'freight.js is live' });
+});
+
 const isEmail = (s = '') => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
 
 function makeTransport() {
